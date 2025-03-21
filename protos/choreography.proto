@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package ddec_choreography;
+
+service Choreography {
+    rpc PrssInit(PrssInitRequest) returns(PrssInitResponse);
+    rpc PreprocKeyGen(PreprocKeyGenRequest) returns (PreprocKeyGenResponse);
+    rpc ThresholdKeyGen(ThresholdKeyGenRequest) returns (ThresholdKeyGenResponse);
+    rpc ThresholdKeyGenResult(ThresholdKeyGenResultRequest) returns(ThresholdKeyGenResultResponse);
+    rpc PreprocDecrypt(PreprocDecryptRequest) returns (PreprocDecryptResponse);
+    rpc ThresholdDecrypt(ThresholdDecryptRequest) returns(ThresholdDecryptResponse);
+    rpc ThresholdDecryptResult(ThresholdDecryptResultRequest) returns (ThresholdDecryptResultResponse);
+    rpc StatusCheck(StatusCheckRequest) returns (StatusCheckResponse);
+    rpc CrsGen(CrsGenRequest) returns(CrsGenResponse);
+    rpc CrsGenResult(CrsGenResultRequest) returns(CrsGenResultResponse);
+}
+
+
+//PrssInit
+message PrssInitRequest {
+    bytes role_assignment = 1;
+    uint32 threshold = 2;
+    bytes params = 3;
+    optional uint64 seed = 4;
+}
+
+message PrssInitResponse {}
+
+//PreprocKeyGen
+message PreprocKeyGenRequest {
+    bytes role_assignment = 1;
+    uint32 threshold = 2;
+    bytes params = 3;
+    optional uint64 seed = 4;
+}
+
+message PreprocKeyGenResponse {
+    bytes request_id = 1;
+}
+
+//ThresholdKeyGen
+message  ThresholdKeyGenRequest{
+    bytes role_assignment = 1;
+    uint32 threshold = 2;
+    bytes params = 3;
+    optional uint64 seed = 4;
+}
+
+message ThresholdKeyGenResponse {
+    bytes request_id = 1;
+}
+
+message ThresholdKeyGenResultRequest {
+    bytes role_assignment = 1;
+    bytes params = 2;
+    optional uint64 seed = 3;
+}
+
+message ThresholdKeyGenResultResponse {
+    bytes pub_keyset = 1;
+}
+
+//PreprocDecrypt
+message PreprocDecryptRequest {
+    bytes role_assignment = 1;
+    uint32 threshold = 2;
+    bytes params = 3;
+    optional uint64 seed = 4;
+}
+
+message PreprocDecryptResponse {
+    bytes request_id = 1;
+}
+
+//ThresholdDecrypt
+message ThresholdDecryptRequest {
+    bytes role_assignment = 1;
+    uint32 threshold = 2;
+    bytes params = 3;
+    optional uint64 seed = 4;
+}
+
+message ThresholdDecryptResponse {
+    bytes request_id = 1;
+}
+
+message ThresholdDecryptResultRequest {
+    bytes request_id = 1;
+}
+
+message ThresholdDecryptResultResponse{
+    bytes plaintext = 1;
+}
+
+//CRS Gen
+message CrsGenRequest {
+    bytes role_assignment = 1;
+    uint32 threshold = 2;
+    bytes params = 3;
+    optional uint32 max_num_bits = 4;
+    optional uint64 seed = 5;
+}
+
+message CrsGenResponse {
+    bytes request_id = 1;
+}
+
+message CrsGenResultRequest {
+    bytes request_id = 1;
+}
+
+message CrsGenResultResponse {
+    bytes crs = 1;
+}
+
+//Status check
+message StatusCheckRequest {
+    bytes request_id = 1;
+}
+
+message StatusCheckResponse {
+    bytes status = 1;
+}

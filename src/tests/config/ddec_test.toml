@@ -1,0 +1,32 @@
+[protocol.host]
+address = "p1"
+port = 50000
+id = 1
+choreoport = 60000
+
+[certpaths]
+cert = "/path/to/cert"
+key = "/path/to/key"
+calist = "/path/one,/path/two"
+
+[[protocol.peers]]
+address = "p2"
+port = 50001
+id = 2
+choreoport = 60001
+
+[[protocol.peers]]
+address = "p3"
+port = 50002
+id = 3
+choreoport = 60002
+
+[net_conf]
+message_limit = 70
+multiplier = 1.1
+max_interval = 5 
+max_elapsed_time = 300 
+network_timeout = 10
+network_timeout_bk = 300 
+network_timeout_bk_sns = 1200 
+max_en_decode_message_size = 2147483648
