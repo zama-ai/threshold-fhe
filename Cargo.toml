@@ -1,0 +1,242 @@
+[package]
+name = "threshold-fhe"
+edition = "2021"
+version = "0.1.0"
+homepage = "https://zama.ai/"
+build = "build.rs"
+repository = "https://github.com/zama-ai/threshold-fhe"
+license = "BSD-3-Clause-Clear"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+aes = "=0.8.4"
+aes-prng = "=0.2.1"
+aligned-vec = "=0.6.1" # need to match what's in tfhe-rs
+anyhow = "=1.0.93"
+async-trait = "=0.1.83"
+backoff = { version = "=0.4.0", features = ["tokio"], optional = true }
+bincode = "=1.3.3"
+cfg-if = "=1.0.0"
+clap = { version = "=4.5.30", features = ["derive", "env"] }
+conf-trace = { path = "conf-trace", optional = true }
+const_format = "=0.2.34"
+crypto-bigint = { version = "=0.6.0-rc.6", features = [
+    "serde",
+    "rand_core",
+    "extra-sizes",
+], optional = true }
+dashmap = "=6.1.0"
+derive_more = { version = "=1.0.0", features = ["display"] }
+futures = "=0.3.31"
+g2p = "=1.2.0"
+itertools = "=0.13.0"
+lazy_static = "=1.5.0"
+minijinja = { version = "=2.4.0", features = ["loader"], optional = true }
+mockall = "=0.13.0"
+ndarray = { version = "=0.16.1", features = ["serde"] }
+num-integer = "=0.1.46"
+num-traits = "=0.2.19"
+opentelemetry = { version = "=0.27.1", optional = true }
+paste = "=1.0.15"
+peak_alloc = {version = "=0.2.1", optional = true}
+prost = "=0.13.5"
+rand = "=0.8.5"
+rayon = "=1.10.0"
+redis = { version = "=0.27.5", optional = true }
+rcgen = { version = "=0.13.1", optional = true }
+serde = { version = "=1.0.217", features = ["derive", "rc"] }
+serde_json = "=1.0.132"
+sha3 = "=0.10.8"
+strum = { version = "=0.26.3", features = ["derive"] }
+strum_macros = "=0.26.4"
+tokio = { version = "=1.43.0", features = [
+    "fs",
+    "sync",
+    "rt",
+    "macros",
+    "time",
+], optional = true }
+tonic = { version = "=0.12.3", features = ["tls"], optional = true }
+tonic-health = { version = "=0.12.3", optional = true }
+tower = { version = "=0.5.2", features = ["retry", "timeout"], optional = true }
+tower-http = { version = "=0.6.2", features = ["trace"], optional = true }
+tfhe = { version = "=1.0", features = [
+    "boolean",
+    "shortint",
+    "integer",
+    "zk-pok",
+] }
+tfhe-csprng = "=0.5.0"
+tracing = { version = "=0.1.41", features = ["log"] }
+x509-parser = "=0.16.0"
+zeroize = { version = "=1.8.1", features = ["zeroize_derive"] }
+tfhe-zk-pok = { version = "=0.5.0", optional = true }
+tfhe-versionable = "=0.5.0"
+
+# we need getrandom to have the js feature so that it can target wasm
+# this is an indirect dependency
+getrandom = { version = "=0.2.15", features = ["js"] }
+
+[build-dependencies]
+tonic-build = "=0.12.3"
+
+[dev-dependencies]
+criterion = "=0.5.1"
+ctor = "=0.2.9"
+proptest = "=1.5.0"
+pprof = { version = "=0.13.0", features = ["flamegraph", "criterion"] }
+rstest = "=0.23.0"
+serial_test = "=3.2.0"
+tempfile = "=3.16.0"
+test-log = { version = "=0.2.16", features = ["trace"] }
+tracing-test = "=0.2.5"
+webpki = { version = "=0.22.4", features = ["std"] }
+rustls = { version = "=0.23.18", default-features = false, features = ["std"] }
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "moby"
+path = "src/bin/moby/moby.rs"
+required-features = ["choreographer"]
+
+[[bin]]
+name = "mobygo"
+path = "src/bin/moby/mobygo.rs"
+required-features = ["choreographer"]
+
+[[bin]]
+name = "gen-experiment"
+path = "src/bin/benches/gen-experiment.rs"
+required-features = ["templating"]
+
+[[bin]]
+name = "stairwayctl"
+path = "src/experimental/bin/stairwayctl.rs"
+required-features = ["experimental", "choreographer", "testing"]
+
+[[bin]]
+name = "threshold-gen-tls-certs"
+path = "src/bin/threshold-gen-tls-certs.rs"
+
+[[bench]]
+name = "ddec"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "decoding"
+harness = false
+required-features = ["experimental"]
+
+[[bench]]
+name = "algebra"
+harness = false
+required-features = ["experimental"]
+
+[[bench]]
+name = "bgv"
+harness = false
+required-features = ["experimental", "testing"]
+
+[[bench]]
+name = "bench_switch_and_squash"
+harness = false
+required-features = ["testing"]
+
+[[bench]]
+name = "bench_prss"
+harness = false
+required-features = ["extension_degree_8"]
+
+[[bench]]
+name = "prep"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "bit_dec"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "ceremony"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[features]
+default = ["non-wasm", "extension_degree_4"]
+# Some utilities used in the `testing` feature require the `non-wasm` feature to be enabled
+testing = ["dep:tokio", "non-wasm"]
+slow_tests = ["testing", "all_extension_degrees"]
+sequential_sns = []
+experimental = ["dep:crypto-bigint", "choreographer"]
+templating = ["minijinja"]
+choreographer = []
+measure_memory = ["dep:peak_alloc", "choreographer"]
+# put all the dependencies that does not work well with wasm
+# namely libraries that doesn't work on 32-bit architectures
+# or uses tokio
+non-wasm = [
+    "dep:conf-trace",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tonic-health",
+    "dep:backoff",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:opentelemetry",
+    "dep:redis",
+    "dep:rcgen",
+    "dep:tfhe-zk-pok",
+]
+all_extension_degrees = [
+    "extension_degree_3",
+    "extension_degree_4",
+    "extension_degree_5",
+    "extension_degree_6",
+    "extension_degree_7",
+    "extension_degree_8",
+]
+extension_degree_8 = []
+extension_degree_7 = []
+extension_degree_6 = []
+extension_degree_5 = []
+extension_degree_4 = []
+extension_degree_3 = []
+
+[profile.wasm]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+
+[profile.dev.package."*"]
+# Set the default for dependencies in Development mode.
+opt-level = 3
+
+[profile.dev]
+# Turn on a small amount of optimization in Development mode.
+opt-level = 1
+
+[profile.test]
+opt-level = 3
+
+[profile.bench]
+debug = true
+
+# actual release profile
+[profile.release]
+# enforce LTO to fat, which makes compilation much more expensive (time and memory), but can improve runtime performance
+lto = "fat"
+
+# profile for testing and CI
+[profile.release-lto-off]
+# use release profile settings
+inherits = "release"
+# but set LTO to the default (off instead of fat)
+lto = "off"
+
