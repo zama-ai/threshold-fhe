@@ -3,7 +3,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/threshold-fhe-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="assets/threshold-fhe-light.png">
-  <img width=600 alt="Zama TFHE-rs">
+  <img width=600 alt="Zama Threshold FHE">
 </picture>
 </p>
 
