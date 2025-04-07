@@ -1,6 +1,6 @@
 # Conf-trace
 
-Conf-trace is a library shared by multiple KMS services that provides configuration and tracing functionality. It offers robust telemetry, request tracing, and gRPC request handling capabilities.
+Conf-trace is a library that provides configuration and tracing functionality. It offers robust telemetry, request tracing, and gRPC request handling capabilities.
 
 ## Features
 
@@ -220,4 +220,3 @@ The metrics system provides several types of measurements:
 ### Gauges
 - `{prefix}_gauge`: A general-purpose gauge for recording independent values. Unlike counters and histograms which track cumulative values or distributions, gauges record instantaneous values that can go up or down. They are useful for metrics like number of active connections, current memory usage, or any other point-in-time measurements.
 
-For detailed metrics documentation and best practices, see [Metrics Guide](docs/metrics.md).
