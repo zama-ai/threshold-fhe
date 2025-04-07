@@ -53,7 +53,7 @@ It is also a preview of a larger repository that we'll release later, where we o
 > **threshold-fhe** is a snapshot of the work-in-progress code of what will eventually become a NIST submission. Use at your own risk!
 
 The main way to use the repository is to run experiments and benchmarks on the various threshold protocols,
-which we describe in detail in the file [docs/threshold-benchmark.md](threshold-benchmark.md).
+which we describe in detail in the file [docs/threshold-benchmark.md](docs/threshold-benchmark.md).
 It is also possible to use the the repository as a library (see the example in `examples/distributed_decryption.rs`),
 but the public API is not documented so use your own discretion.
 
