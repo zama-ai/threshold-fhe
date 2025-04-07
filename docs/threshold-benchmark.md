@@ -11,8 +11,12 @@ This page describes how to run the benchmarks in a wide range of configurations 
 
 - `benches`
   - Code needed for benchmarking the threshold protocols.
+- `conf-trace`
+  - A small library for configuration and tracing functionality.
 - `config`
   - Default and example configurations needed when benchmarking and testing the threshold protocols.
+- `docs`
+  - Documentation is stored here, notably it contains our preliminary draft NIST main submission document.
 - `examples`
   - Some example code to get you started.
 - `experiments`
@@ -25,8 +29,6 @@ This page describes how to run the benchmarks in a wide range of configurations 
   - Bash scripts used for testing.
 - `tests`
   - Integration tests.
-- `TechnicalDocumentation`
-  - Contains our preliminary draft NIST main submission document. 
 
 ## Benchmarks with real network
 
@@ -207,5 +209,5 @@ cargo flamegraph --root --bench prep --features="testing extension_degree_8" -- 
 
 ## Testing
 
-Integration tests are located in the `tests` folder and require a `Redis` server to be running locally.
-Make sure to install `Redis`and run `redis-server` in a separate terminal before running these tests.
+Integration tests are located in the `tests` folder and require a `redis` server to be running locally.
+Make sure to install `redis`and run `redis-server` in a separate terminal before running these tests.

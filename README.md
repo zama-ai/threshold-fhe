@@ -10,7 +10,7 @@
 <hr/>
 
 <p align="center">
-  <a href="https://eprint.iacr.org/2023/815"> 📃 White Paper</a> | <a href="https://zama.ai/community"> 💛 Community support</a> | <a href="https://github.com/zama-ai/awesome-zama"> 📚 FHE resources by Zama</a>
+  <a href="https://zama.ai/community"> 💛 Community support</a> | <a href="https://github.com/zama-ai/awesome-zama"> 📚 FHE resources by Zama</a>
 </p>
 
 <p align="center">
@@ -28,23 +28,24 @@ and so on for TFHE, BFV and BGV.
 Our protocols are designed to be both secure and robust when a fraction
 of the parties are malicious.
 
-This repository is an early sneak peak of what we aim to be part of the submission
+This repository is an early sneak peak of what we aim to be part of our submission
 for the [NIST call for Multi-Party Threshold Cryptography](https://csrc.nist.gov/projects/threshold-cryptography).
+It is also a preview of a larger repository that we'll release later, where we open-source our HTTPZ key management system.
 
 ### Main features
 
 - Threshold key generation for the three FHE schemes
 - Distributed decryption FHE with two techniques
-  - Using noise flooding
-  - Using bit decomposition
+  - Using noise flooding (section 2.2.1 of the [spec](docs/CryptographicDocumentation.pdf))
+  - Using bit decomposition (section 2.2.2 of the [spec](docs/CryptographicDocumentation.pdf))
 - Resharing of FHE key shares
 - Distributed setup for CRS (common reference string) using in ZK proofs
 
 ### Additional resources
 
 - Blog post *TODO link*
-- The [Noah's ark](https://eprint.iacr.org/2023/815) paper contains the technical details of our protocols
-- An [inital preliminary version of our proposed NIST submission](TechnicalDocumentation/CryptographicDocumentation.pdf), which contains the detailed specification
+- The [Noah's ark](https://eprint.iacr.org/2023/815) paper contains the technical details of some of our protocols
+- An [inital preliminary version of our proposed NIST submission](docs/CryptographicDocumentation.pdf), which contains the detailed specification
 
 ## How to use this repository
 
@@ -52,7 +53,7 @@ for the [NIST call for Multi-Party Threshold Cryptography](https://csrc.nist.gov
 > **threshold-fhe** is a snapshot of the work-in-progress code of what will eventually become a NIST submission. Use at your own risk!
 
 The main way to use the repository is to run experiments and benchmarks on the various threshold protocols,
-which we describe in detail in the file [threshold-benchmark.md](threshold-benchmark.md).
+which we describe in detail in the file [docs/threshold-benchmark.md](threshold-benchmark.md).
 It is also possible to use the the repository as a library (see the example in `examples/distributed_decryption.rs`),
 but the public API is not documented so use your own discretion.
 
