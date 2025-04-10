@@ -23,19 +23,18 @@
 ### What is it?
 
 This repository provides threshold multi-party computation protocols
-such as threshold key generation, threshold decryption
-and so on for TFHE, BFV and BGV.
+such as threshold key generation and threshold decryption for TFHE, BFV and BGV.
 Our protocols are designed to be both secure and robust when a fraction
 of the parties are malicious.
 
 This repository is an early sneak peak of what we aim to be part of our submission
 for the [NIST call for Multi-Party Threshold Cryptography](https://csrc.nist.gov/projects/threshold-cryptography).
-It is also a preview of a larger repository that we'll release later, where we open-source our HTTPZ key management system.
+It is also a preview of a part of a larger repository that we'll release later, where we open-source our HTTPZ key management system.
 
 ### Main features
 
 - Threshold key generation for the three FHE schemes
-- Distributed decryption FHE with two techniques
+- Distributed decryption for FHE ciphertexts with two techniques:
   - Using noise flooding (section 2.2.1 of the [spec](docs/CryptographicDocumentation.pdf))
   - Using bit decomposition (section 2.2.2 of the [spec](docs/CryptographicDocumentation.pdf))
 - Resharing of FHE key shares
@@ -45,7 +44,7 @@ It is also a preview of a larger repository that we'll release later, where we o
 
 - Blog post *TODO link*
 - The [Noah's ark](https://eprint.iacr.org/2023/815) paper contains the technical details of some of our protocols
-- An [inital preliminary version of our proposed NIST submission](docs/CryptographicDocumentation.pdf), which contains the detailed specification
+- An [initial, preliminary version of our proposed NIST submission](docs/CryptographicDocumentation.pdf), which contains the detailed specification of all contained protocols
 
 ## How to use this repository
 
@@ -55,5 +54,4 @@ It is also a preview of a larger repository that we'll release later, where we o
 The main way to use the repository is to run experiments and benchmarks on the various threshold protocols,
 which we describe in detail in the file [docs/threshold-benchmark.md](docs/threshold-benchmark.md).
 It is also possible to use the the repository as a library (see the example in `examples/distributed_decryption.rs`),
-but the public API is not documented so use your own discretion.
-
+but the public API is not well-documented yet, so use your own discretion.
