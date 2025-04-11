@@ -42,9 +42,9 @@ It is also a preview of a part of a larger repository that we'll release later, 
 
 ## Getting Started
 
-### Installation
+### Requirements
 
-**TODO**
+See the [requirements](docs/threshold-benchmark.md#prerequisites-for-running-benchmarks) for the benchmarks.
 
 ### A simple example
 
@@ -54,7 +54,38 @@ It is also a preview of a part of a larger repository that we'll release later, 
 The main way to use the repository is to run experiments and benchmarks on the various threshold protocols, which we describe in detail in the file [docs/threshold-benchmark.md](docs/threshold-benchmark.md).
 It is also possible to use the the repository as a library (see the example in [examples/distributed_decryption.rs](examples/distributed_decryption.rs), but the public API is not well-documented yet, so use your own discretion.
 
-**TODO: add a small but interesting example**
+
+To start the benchmarked system `moby` in a dockerized environment locally with 4 parties and threshold 1:
+```{bash}
+$ cargo make tfhe-docker-image
+$ cargo make tfhe-bench-run
+```
+
+You can then start interacting with it via the `mobygo` cli.
+- Initiate an insecure KeyGen
+```{bash}
+$ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml threshold-key-gen-result --sid 1  --storage-path temp --generate-params bc-params-sam-sns
+```
+
+- Initialize PRSS (one time setup)
+```{bash}
+$ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml prss-init --ring residue-poly-z128 --sid 2
+```
+
+- Initiate 10 decryptions
+```{bash}
+# Prepare correlated randomness
+$ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml preproc-decrypt --decryption-mode noise-flood-small --path-pubkey temp/pk.bin --tfhe-type u16 --num-ctxts 10 --sid 3
+
+# Perform online phase
+$ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml threshold-decrypt --decryption-mode noise-flood-small --path-pubkey temp/pk.bin --tfhe-type u16 --num-ctxts 10 --sid 4  --preproc-sid 3
+
+# Check the status
+$ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml status-check --sid 4  --keep-retry true
+
+# Fetch the result
+$ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml threshold-decrypt-result --sid 4
+```
 
 ### Resources
 
