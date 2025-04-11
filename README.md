@@ -62,7 +62,7 @@ $ cargo make tfhe-bench-run
 ```
 
 You can then start interacting with it via the `mobygo` cli.
-- Initiate an insecure KeyGen
+- Initiate an __insecure__ Key Generation
 ```{bash}
 $ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml threshold-key-gen-result --sid 1  --storage-path temp --generate-params bc-params-sam-sns
 ```
@@ -72,7 +72,7 @@ $ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.to
 $ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml prss-init --ring residue-poly-z128 --sid 2
 ```
 
-- Initiate 10 decryptions
+- Perform 10 distributed decryptions
 ```{bash}
 # Prepare correlated randomness
 $ cargo run --bin mobygo --features="choreographer" -- -c temp/tfhe-bench-run.toml preproc-decrypt --decryption-mode noise-flood-small --path-pubkey temp/pk.bin --tfhe-type u16 --num-ctxts 10 --sid 3
