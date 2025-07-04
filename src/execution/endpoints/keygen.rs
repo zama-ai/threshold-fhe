@@ -2047,7 +2047,7 @@ pub mod tests {
 
     #[cfg(feature = "slow_tests")]
     #[test]
-    fn decompresion_keygen_f4() {
+    fn decompression_keygen_f4() {
         let params = PARAMS_TEST_BK_SNS;
         let num_parties = 4;
         let threshold = 1;
