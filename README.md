@@ -18,6 +18,16 @@
   <a href="https://github.com/zama-ai/bounty-program"><img src="https://img.shields.io/badge/Contribute-Zama%20Bounty%20Program-%23ffd208?style=flat-square"></a>
 </p>
 
+> [!NOTE]
+> **Important Notice**
+>
+> This repository is _not_ actively maintained.
+> It is a snapshot intended for our submission to the [NIST call for Multi-Party Threshold Cryptography](https://csrc.nist.gov/projects/threshold-cryptography).
+>
+> For the latest, actively maintained code (including management wrapper functionality), please visit our [KMS repository](https://github.com/zama-ai/kms).
+> The code relevant to NIST is located at: [kms/core/threshold](https://github.com/zama-ai/kms/tree/main/core/threshold).
+
+
 ## About
 
 ### What is it?
@@ -26,10 +36,6 @@ This repository provides threshold multi-party computation protocols
 such as threshold key generation and threshold decryption for TFHE, BFV and BGV.
 Our protocols are designed to be both secure and robust when a fraction
 of the parties are malicious.
-
-This repository is an early sneak peak of what we aim to be part of our submission
-for the [NIST call for Multi-Party Threshold Cryptography](https://csrc.nist.gov/projects/threshold-cryptography).
-It is also a preview of a part of a larger repository that we'll release later, where we open-source our fheVM threshold key management system.
 
 ### Main features
 
