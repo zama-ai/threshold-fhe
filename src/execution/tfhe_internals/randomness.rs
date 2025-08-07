@@ -25,7 +25,7 @@ use super::parameters::EncryptionType;
 
 ///Structure to get randomness needed inside encryptions
 ///the mask is from seeded rng, seed is derived from MPC protocol
-///for now the noise part is put into a vector in advance and poped when needed
+///for now the noise part is put into a vector in advance and popped when needed
 pub struct MPCEncryptionRandomGenerator<
     Z: BaseRing,
     Gen: ByteRandomGenerator,
