@@ -1,0 +1,282 @@
+[package]
+name = "threshold-fhe"
+edition = "2021"
+version = "0.1.0"
+homepage = "https://zama.ai/"
+build = "build.rs"
+repository = "https://github.com/zama-ai/threshold-fhe"
+license = "BSD-3-Clause-Clear"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# ⚠️ IMPORTANT: Add new dependencies to workspace root Cargo.toml, NOT here!
+# Use .workspace = true to reference workspace dependencies
+# Maintain alphabetical order
+aes.workspace = true
+aes-prng.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+attestation-doc-validation = { workspace = true, optional = true}
+backoff = { workspace = true, features = ["tokio"], optional = true }
+bc2wrap.workspace = true
+bincode.workspace = true
+cfg-if.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+const_format.workspace = true
+crypto-bigint = { workspace = true, optional = true }
+dashmap.workspace = true
+derive_more.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+g2p.workspace = true
+getrandom.workspace = true
+hex = { workspace = true, features = ["serde"] }
+hyper-rustls-ring = { workspace = true, optional = true }
+itertools.workspace = true
+k256.workspace = true
+lazy_static.workspace = true
+minijinja = { workspace = true, optional = true }
+mockall.workspace = true
+ndarray.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+observability = { workspace = true, optional = true }
+oid-registry.workspace = true
+opentelemetry = { workspace = true, optional = true }
+paste.workspace = true
+peak_alloc = { workspace = true, optional = true }
+prost.workspace = true
+rand.workspace = true
+rayon.workspace = true
+rcgen = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+sha2.workspace = true
+sha3.workspace = true
+statrs.workspace = true
+strum = { workspace = true, features = ["derive"] }
+strum_macros.workspace = true
+tfhe = { workspace = true, features = [
+    "boolean",
+    "shortint",
+    "integer",
+    "zk-pok",
+] }
+tfhe-csprng.workspace = true
+tfhe-versionable.workspace = true
+tfhe-zk-pok = { workspace = true, optional = true }
+tokio = { workspace = true, features = [
+    "sync",
+    "rt",
+    "macros",
+    "time",
+], optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tonic = { workspace = true, features = ["tls-ring"], optional = true }
+tonic-health = { workspace = true, optional = true }
+tonic-tls = { workspace = true, optional = true }
+tower = { workspace = true, features = ["retry", "timeout"], optional = true }
+tower-http = { workspace = true, features = ["trace"], optional = true }
+tracing = { workspace = true, features = ["log"] }
+x509-parser = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[dev-dependencies]
+# ⚠️ IMPORTANT: Add new dependencies to workspace root Cargo.toml, NOT here!
+# Use .workspace = true to reference workspace dependencies
+# Maintain alphabetical order
+async-std.workspace = true
+criterion= {workspace = true, features = ["async_tokio", "html_reports"] }
+ctor.workspace = true
+pprof.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+rustls-webpki.workspace = true
+serial_test.workspace = true
+tempfile.workspace = true
+tfhe-zk-pok = { workspace = true, features = ["experimental"] }
+threshold-fhe = { workspace = true, features = ["testing"] }
+tracing-test.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["getrandom", "opentelemetry", "prost"]
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "moby"
+path = "src/bin/moby/moby.rs"
+required-features = ["choreographer"]
+
+[[bin]]
+name = "mobygo"
+path = "src/bin/moby/mobygo.rs"
+required-features = ["choreographer"]
+
+[[bin]]
+name = "gen-experiment"
+path = "src/bin/benches/gen-experiment.rs"
+required-features = ["templating"]
+
+[[bin]]
+name = "stairwayctl"
+path = "src/experimental/bin/stairwayctl.rs"
+required-features = ["experimental", "choreographer", "testing"]
+
+[[bin]]
+name = "threshold-gen-tls-certs"
+path = "src/bin/threshold-gen-tls-certs.rs"
+
+[[bin]]
+name = "non-threshold-kat"
+path = "src/bin/non-threshold/kat.rs"
+
+[[bench]]
+name = "ddec"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "decoding"
+harness = false
+required-features = ["experimental"]
+
+[[bench]]
+name = "algebra"
+harness = false
+required-features = ["experimental"]
+
+[[bench]]
+name = "bgv"
+harness = false
+required-features = ["experimental", "testing"]
+
+[[bench]]
+name = "bench_switch_and_squash"
+harness = false
+required-features = ["testing"]
+
+[[bench]]
+name = "bench_prss"
+harness = false
+required-features = ["extension_degree_8"]
+
+[[bench]]
+name = "prep"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "bit_dec"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "ceremony"
+harness = false
+required-features = ["testing", "extension_degree_8"]
+
+[[bench]]
+name = "non-threshold_erc20"
+path = "benches/non-threshold/erc20.rs"
+harness = false
+
+
+[[bench]]
+name = "non-threshold_basic-ops"
+path = "benches/non-threshold/basic_ops.rs"
+harness = false
+
+[[bench]]
+name = "non-threshold_keygen"
+path = "benches/non-threshold/keygen.rs"
+harness = false
+
+[features]
+default = ["non-wasm", "extension_degree_4"]
+# Some utilities used in the `testing` feature require the `non-wasm` feature to be enabled
+testing = ["dep:tokio", "non-wasm"]
+slow_tests = ["testing", "all_extension_degrees"]
+experimental = ["dep:crypto-bigint", "choreographer", "testing"]
+templating = ["minijinja"]
+choreographer = ["malicious_strategies"]
+measure_memory = ["dep:peak_alloc", "choreographer"]
+malicious_strategies = ["testing"]
+# put all the dependencies that does not work well with wasm
+# namely libraries that doesn't work on 32-bit architectures
+# or uses tokio
+non-wasm = [
+    "dep:attestation-doc-validation",
+    "dep:hyper-rustls-ring",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:tonic",
+    "dep:tonic-health",
+    "dep:tonic-tls",
+    "dep:backoff",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:observability",
+    "dep:opentelemetry",
+    "dep:redis",
+    "dep:rcgen",
+    "dep:tfhe-zk-pok",
+    "dep:x509-parser",
+]
+all_extension_degrees = [
+    "extension_degree_3",
+    "extension_degree_4",
+    "extension_degree_5",
+    "extension_degree_6",
+    "extension_degree_7",
+    "extension_degree_8",
+]
+extension_degree_8 = []
+extension_degree_7 = []
+extension_degree_6 = []
+extension_degree_5 = []
+extension_degree_4 = []
+extension_degree_3 = []
+
+
+[profile.dev.package."*"]
+# Set the default for dependencies in Development mode.
+opt-level = 3
+
+[profile.dev]
+# Turn on a small amount of optimization in Development mode.
+opt-level = 1
+# Ensure all possible speed ups on dev compilation on Macos is enabled
+split-debuginfo = "unpacked"
+
+[profile.test]
+opt-level = 3
+
+[profile.bench]
+debug = true
+
+# actual release profile
+[profile.release]
+# enforce LTO to fat, which makes compilation much more expensive (time and memory), but can improve runtime performance
+lto = "fat"
+
+# profile for testing and CI
+[profile.release-lto-off]
+# use release profile settings
+inherits = "release"
+# but set LTO to the default (off instead of fat)
+lto = "off"
+
+[patch.crates-io]
+# MEDIUM RISK: Using fork instead of upstream - verify changes, consider upstreaming
+attestation-doc-validation = { git = 'https://github.com/mkmks/attestation-doc-validation.git', branch = 'timestamps' }
+rcgen = { git = 'https://github.com/mkmks/rcgen.git', branch = 'k256' }
+rustls = { git = 'https://github.com/mkmks/rustls.git', branch = 'k256' }
+rustls-pki-types = { git = 'https://github.com/mkmks/pki-types.git', branch = 'k256' }
+rustls-webpki = { git = 'https://github.com/mkmks/webpki.git', branch = 'k256' }
+tokio-rustls = { git = 'https://github.com/mkmks/tokio-rustls.git', branch = 'k256' }
