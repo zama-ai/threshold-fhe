@@ -1,17 +1,5 @@
-//! To use the latest version of threshold-fhe in your project,
-//! you first need to add it as a dependency in your `Cargo.toml`:
-//!
-//! ```
-//! threshold_fhe = { git = "https://github.com/zama-ai/kms-core.git" }
-//! ```
-//!
-//! This is an example where we setup a testing runtime that runs 4 parties on the same machine.
-//! You can run it with `cargo run -F testing --example distributed_decryption`.
 use aes_prng::AesRng;
-use rand::{Rng, SeedableRng};
-use std::sync::Arc;
-use tfhe::{set_server_key, FheUint8};
-use threshold_fhe::{
+use nexus::{
     algebra::{galois_rings::degree_4::ResiduePolyF4Z64, structure_traits::Ring},
     execution::{
         endpoints::decryption::{threshold_decrypt64, DecryptionMode, RadixOrBoolCiphertext},
@@ -24,6 +12,9 @@ use threshold_fhe::{
     },
     networking::NetworkMode,
 };
+use rand::{Rng, SeedableRng};
+use std::sync::Arc;
+use tfhe::{set_server_key, FheUint8};
 
 #[tokio::main]
 async fn main() {

@@ -3,8 +3,8 @@ use observability::conf::{Settings, TelemetryConfig};
 use observability::telemetry::init_tracing;
 #[cfg(feature = "measure_memory")]
 use peak_alloc::PeakAlloc;
-use threshold_fhe::conf::party::PartyConf;
-use threshold_fhe::grpc;
+use nexus::conf::party::PartyConf;
+use nexus::grpc;
 use tokio_rustls::rustls::crypto::aws_lc_rs::default_provider;
 
 #[cfg(feature = "measure_memory")]
@@ -68,7 +68,7 @@ const EXTENSION_DEGREE: usize = 8;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     default_provider().install_default().unwrap();
     #[cfg(feature = "measure_memory")]
-    threshold_fhe::allocator::MEM_ALLOCATOR.get_or_init(|| PEAK_ALLOC);
+    nexus::allocator::MEM_ALLOCATOR.get_or_init(|| PEAK_ALLOC);
 
     println!("STARTING MOBY BINARY WITH EXTENSION DEGREE {EXTENSION_DEGREE}");
     let args = Cli::parse();

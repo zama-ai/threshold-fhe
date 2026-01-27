@@ -2,16 +2,16 @@ use ctor::ctor;
 use paste::paste;
 use redis::{Cmd, ConnectionLike};
 use std::num::Wrapping;
-use threshold_fhe::algebra::base_ring::{Z128, Z64};
-use threshold_fhe::algebra::galois_rings::degree_4::ResiduePolyF4;
-use threshold_fhe::execution::online::preprocessing::redis::RedisConf;
-use threshold_fhe::execution::online::preprocessing::{create_redis_factory, PreprocessorFactory};
-use threshold_fhe::execution::online::triple::Triple;
-use threshold_fhe::execution::runtime::party::Role;
-use threshold_fhe::execution::sharing::share::Share;
+use nexus::algebra::base_ring::{Z128, Z64};
+use nexus::algebra::galois_rings::degree_4::ResiduePolyF4;
+use nexus::execution::online::preprocessing::redis::RedisConf;
+use nexus::execution::online::preprocessing::{create_redis_factory, PreprocessorFactory};
+use nexus::execution::online::triple::Triple;
+use nexus::execution::runtime::party::Role;
+use nexus::execution::sharing::share::Share;
 
 #[cfg(feature = "testing")]
-use threshold_fhe::{
+use nexus::{
     execution::{
         endpoints::keygen::SecureOnlineDistributedKeyGen,
         online::preprocessing::orchestration::producer_traits::SecureLargeProducerFactory,
@@ -240,7 +240,7 @@ fn test_dkg_orchestrator_large(
     tag: tfhe::Tag,
 ) {
     use itertools::Itertools;
-    use threshold_fhe::{
+    use nexus::{
         algebra::{galois_rings::degree_4::ResiduePolyF4Z64, structure_traits::Ring},
         execution::{
             endpoints::keygen::OnlineDistributedKeyGen, keyset_config::KeySetConfig,
@@ -273,7 +273,7 @@ fn test_dkg_orchestrator_large(
         let rt_handle = rt.handle().clone();
         let tag = tag.clone();
         handles.add(thread::spawn(move || {
-            use threshold_fhe::execution::runtime::sessions::session_parameters::GenericParameterHandles;
+            use nexus::execution::runtime::sessions::session_parameters::GenericParameterHandles;
 
             let _guard = rt_handle.enter();
             println!("Thread created for party {party}");
@@ -346,7 +346,7 @@ fn test_dkg_orchestrator_large(
 #[cfg(feature = "testing")]
 #[test]
 fn test_dkg_orchestrator_params8_small_no_sns() {
-    use threshold_fhe::execution::tfhe_internals::parameters::PARAMS_TEST_BK_SNS;
+    use nexus::execution::tfhe_internals::parameters::PARAMS_TEST_BK_SNS;
 
     let params = PARAMS_TEST_BK_SNS;
     let params = params.get_params_without_sns();
@@ -372,7 +372,7 @@ fn test_dkg_orchestrator_params8_small_no_sns() {
 #[cfg(feature = "testing")]
 #[tokio::test]
 async fn test_cast_fail_memory_bit_dec_preprocessing() {
-    use threshold_fhe::{
+    use nexus::{
         algebra::galois_rings::degree_4::ResiduePolyF4Z64,
         execution::online::preprocessing::{
             dummy::DummyPreprocessing, BitDecPreprocessing, BitPreprocessing, TriplePreprocessing,

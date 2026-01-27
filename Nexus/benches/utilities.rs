@@ -5,9 +5,9 @@ use tfhe::{
     ClientKey, Tag,
 };
 #[cfg(feature = "measure_memory")]
-use threshold_fhe::allocator::MEM_ALLOCATOR;
-use threshold_fhe::execution::tfhe_internals::parameters::DKGParams;
-use threshold_fhe::execution::tfhe_internals::parameters::{
+use nexus::allocator::MEM_ALLOCATOR;
+use nexus::execution::tfhe_internals::parameters::DKGParams;
+use nexus::execution::tfhe_internals::parameters::{
     BC_PARAMS_SNS, NIST_PARAMS_P32_SNS_FGLWE, NIST_PARAMS_P32_SNS_LWE, NIST_PARAMS_P8_SNS_FGLWE,
     NIST_PARAMS_P8_SNS_LWE,
 };

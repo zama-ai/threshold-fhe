@@ -6,19 +6,19 @@ use pprof::criterion::Output;
 use pprof::criterion::PProfProfiler;
 use rand::RngCore;
 use rand::SeedableRng;
-use threshold_fhe::execution::runtime::test_runtime::generate_fixed_roles;
-use threshold_fhe::experimental::algebra::levels::*;
-use threshold_fhe::experimental::algebra::ntt::N65536;
-use threshold_fhe::experimental::algebra::ntt::{Const, NTTConstants};
-use threshold_fhe::experimental::bgv::basics::bgv_dec;
-use threshold_fhe::experimental::bgv::basics::bgv_enc;
-use threshold_fhe::experimental::bgv::basics::keygen;
-use threshold_fhe::experimental::bgv::basics::modulus_switch;
-use threshold_fhe::experimental::bgv::ddec::keygen_shares;
-use threshold_fhe::experimental::bgv::endpoints::threshold_decrypt;
-use threshold_fhe::experimental::bgv::runtime::BGVTestRuntime;
-use threshold_fhe::experimental::constants::PLAINTEXT_MODULUS;
-use threshold_fhe::networking::NetworkMode;
+use nexus::execution::runtime::test_runtime::generate_fixed_roles;
+use nexus::experimental::algebra::levels::*;
+use nexus::experimental::algebra::ntt::N65536;
+use nexus::experimental::algebra::ntt::{Const, NTTConstants};
+use nexus::experimental::bgv::basics::bgv_dec;
+use nexus::experimental::bgv::basics::bgv_enc;
+use nexus::experimental::bgv::basics::keygen;
+use nexus::experimental::bgv::basics::modulus_switch;
+use nexus::experimental::bgv::ddec::keygen_shares;
+use nexus::experimental::bgv::endpoints::threshold_decrypt;
+use nexus::experimental::bgv::runtime::BGVTestRuntime;
+use nexus::experimental::constants::PLAINTEXT_MODULUS;
+use nexus::networking::NetworkMode;
 
 fn bench_modswitch(c: &mut Criterion) {
     let mut rng = AesRng::seed_from_u64(0);
@@ -119,19 +119,19 @@ fn bench_bgv_ddec(c: &mut Criterion) {
 
 fn bench_bfv_to_bgv(c: &mut Criterion) {
     let mut rng = AesRng::seed_from_u64(0);
-    let (pk, _) = threshold_fhe::experimental::bfv::basics::keygen::<AesRng>(&mut rng);
+    let (pk, _) = nexus::experimental::bfv::basics::keygen::<AesRng>(&mut rng);
 
     let plaintext_vec: Vec<u32> = (0..N65536::VALUE)
         .map(|_| (rng.next_u64() % PLAINTEXT_MODULUS.get().0) as u32)
         .collect();
     let ct =
-        threshold_fhe::experimental::bfv::basics::bfv_enc(&mut rng, &plaintext_vec, &pk.a, &pk.b);
+        nexus::experimental::bfv::basics::bfv_enc(&mut rng, &plaintext_vec, &pk.a, &pk.b);
 
     let mut group = c.benchmark_group("bfv-to-bgv");
     group.sample_size(10);
     group.bench_function("conversion", |b| {
         b.iter(|| {
-            let _ = threshold_fhe::experimental::bfv::basics::bfv_to_bgv(ct.clone());
+            let _ = nexus::experimental::bfv::basics::bfv_to_bgv(ct.clone());
         });
     });
 }

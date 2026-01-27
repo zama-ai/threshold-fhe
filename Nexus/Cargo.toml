@@ -1,11 +1,10 @@
 [package]
-name = "threshold-fhe"
-edition = "2021"
-version = "0.1.0"
-homepage = "https://zama.ai/"
-build = "build.rs"
-repository = "https://github.com/zama-ai/threshold-fhe"
-license = "BSD-3-Clause-Clear"
+name = "nexus"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -99,7 +98,7 @@ rustls-webpki.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
 tfhe-zk-pok = { workspace = true, features = ["experimental"] }
-threshold-fhe = { workspace = true, features = ["testing"] }
+nexus = { workspace = true, features = ["testing"] }
 tracing-test.workspace = true
 
 [package.metadata.cargo-machete]
@@ -242,41 +241,3 @@ extension_degree_6 = []
 extension_degree_5 = []
 extension_degree_4 = []
 extension_degree_3 = []
-
-
-[profile.dev.package."*"]
-# Set the default for dependencies in Development mode.
-opt-level = 3
-
-[profile.dev]
-# Turn on a small amount of optimization in Development mode.
-opt-level = 1
-# Ensure all possible speed ups on dev compilation on Macos is enabled
-split-debuginfo = "unpacked"
-
-[profile.test]
-opt-level = 3
-
-[profile.bench]
-debug = true
-
-# actual release profile
-[profile.release]
-# enforce LTO to fat, which makes compilation much more expensive (time and memory), but can improve runtime performance
-lto = "fat"
-
-# profile for testing and CI
-[profile.release-lto-off]
-# use release profile settings
-inherits = "release"
-# but set LTO to the default (off instead of fat)
-lto = "off"
-
-[patch.crates-io]
-# MEDIUM RISK: Using fork instead of upstream - verify changes, consider upstreaming
-attestation-doc-validation = { git = 'https://github.com/mkmks/attestation-doc-validation.git', branch = 'timestamps' }
-rcgen = { git = 'https://github.com/mkmks/rcgen.git', branch = 'k256' }
-rustls = { git = 'https://github.com/mkmks/rustls.git', branch = 'k256' }
-rustls-pki-types = { git = 'https://github.com/mkmks/pki-types.git', branch = 'k256' }
-rustls-webpki = { git = 'https://github.com/mkmks/webpki.git', branch = 'k256' }
-tokio-rustls = { git = 'https://github.com/mkmks/tokio-rustls.git', branch = 'k256' }

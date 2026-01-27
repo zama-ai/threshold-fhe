@@ -4,17 +4,17 @@ use itertools::Itertools;
 use pprof::criterion::Output;
 use pprof::criterion::PProfProfiler;
 use rand::SeedableRng;
-use threshold_fhe::algebra::poly::lagrange_interpolation;
-use threshold_fhe::algebra::poly::lagrange_polynomials;
-use threshold_fhe::algebra::poly::Poly;
-use threshold_fhe::algebra::structure_traits::FromU128;
-use threshold_fhe::execution::sharing::shamir::InputOp;
-use threshold_fhe::execution::sharing::shamir::ShamirSharings;
+use nexus::algebra::poly::lagrange_interpolation;
+use nexus::algebra::poly::lagrange_polynomials;
+use nexus::algebra::poly::Poly;
+use nexus::algebra::structure_traits::FromU128;
+use nexus::execution::sharing::shamir::InputOp;
+use nexus::execution::sharing::shamir::ShamirSharings;
 
 fn bench_lagrange_poly(c: &mut Criterion) {
     // params are (num_parties, threshold, max_errors)
 
-    use threshold_fhe::experimental::algebra::levels::LevelOne;
+    use nexus::experimental::algebra::levels::LevelOne;
     let params = vec![(4, 1, 0), (10, 3, 0), (10, 3, 2), (40, 13, 0)];
     let mut group = c.benchmark_group("lagrange_interpolation");
 

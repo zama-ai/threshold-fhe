@@ -11,7 +11,7 @@ use observability::{
     telemetry::init_tracing,
 };
 use rand::{random, RngCore, SeedableRng};
-use threshold_fhe::{
+use nexus::{
     choreography::choreographer::ChoreoRuntime,
     conf::choreo::ChoreoConf,
     experimental::{

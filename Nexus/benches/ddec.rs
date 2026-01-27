@@ -4,7 +4,7 @@ use pprof::criterion::{Output, PProfProfiler};
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use tfhe::{set_server_key, FheUint8};
-use threshold_fhe::{
+use nexus::{
     algebra::{
         galois_rings::degree_8::{ResiduePolyF8Z128, ResiduePolyF8Z64},
         structure_traits::Ring,

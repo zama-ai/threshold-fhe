@@ -12,7 +12,7 @@ use tfhe::{
     integer::BooleanBlock, set_server_key, CompactPublicKey, FheBool, FheUint128, FheUint16,
     FheUint160, FheUint2048, FheUint256, FheUint32, FheUint4, FheUint64, FheUint8,
 };
-use threshold_fhe::{
+use nexus::{
     choreography::{
         choreographer::{ChoreoRuntime, KeySetMaybeCompressed},
         grpc::SupportedRing,

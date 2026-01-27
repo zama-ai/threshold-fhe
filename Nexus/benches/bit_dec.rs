@@ -3,24 +3,24 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 use rand::SeedableRng;
 use std::num::Wrapping;
-use threshold_fhe::algebra::base_ring::Z64;
-use threshold_fhe::algebra::galois_rings::degree_8::ResiduePolyF8Z64;
-use threshold_fhe::algebra::structure_traits::Ring;
-use threshold_fhe::execution::endpoints::decryption::{
+use nexus::algebra::base_ring::Z64;
+use nexus::algebra::galois_rings::degree_8::ResiduePolyF8Z64;
+use nexus::algebra::structure_traits::Ring;
+use nexus::execution::endpoints::decryption::{
     secure_init_prep_bitdec_large_session, secure_init_prep_bitdec_small_session,
 };
-use threshold_fhe::execution::online::bit_manipulation::bit_dec_batch;
-use threshold_fhe::execution::online::preprocessing::dummy::DummyPreprocessing;
-use threshold_fhe::execution::runtime::party::Role;
-use threshold_fhe::execution::runtime::sessions::session_parameters::GenericParameterHandles;
-use threshold_fhe::execution::runtime::sessions::{
+use nexus::execution::online::bit_manipulation::bit_dec_batch;
+use nexus::execution::online::preprocessing::dummy::DummyPreprocessing;
+use nexus::execution::runtime::party::Role;
+use nexus::execution::runtime::sessions::session_parameters::GenericParameterHandles;
+use nexus::execution::runtime::sessions::{
     large_session::LargeSession, small_session::SmallSession,
 };
-use threshold_fhe::execution::sharing::shamir::InputOp;
-use threshold_fhe::execution::sharing::shamir::ShamirSharings;
-use threshold_fhe::execution::sharing::share::Share;
-use threshold_fhe::networking::NetworkMode;
-use threshold_fhe::tests::helper::tests_and_benches::{
+use nexus::execution::sharing::shamir::InputOp;
+use nexus::execution::sharing::shamir::ShamirSharings;
+use nexus::execution::sharing::share::Share;
+use nexus::networking::NetworkMode;
+use nexus::tests::helper::tests_and_benches::{
     execute_protocol_large, execute_protocol_small,
 };
 

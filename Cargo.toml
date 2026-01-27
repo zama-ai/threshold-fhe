@@ -3,39 +3,20 @@ resolver = "2"
 
 members = [
     "bc2wrap",
-    "core/grpc",
-    "core/service",
-    "core/threshold",
-    "core-client",
+    "nexus",
     "observability",
-    "tools/kms-health-check",
-    "tools/generate-test-material",
 ]
 
-# The backward-compatibility modules are excluded from the workspace to avoid dependency conflicts.
-#
-# backward-compatibility/                - Test loading/execution logic with current dependencies
-# backward-compatibility/generate-v0.11.0 - Data generation for v0.11.0 with old KMS version dependencies
-# backward-compatibility/generate-v0.11.1 - Data generation for v0.11.1 with old KMS version dependencies
-# backward-compatibility/generate-v0.13.0 - Data generation for v0.13.0 with old KMS version dependencies
-#
-# The generate crates need to import old KMS versions (e.g., v0.11.0, v0.11.1) which conflict with the
-# current workspace dependencies, creating name conflicts as described in:
-# https://github.com/rust-lang/cargo/issues/12891
-#
-# Note: It's not possible to only generate the lock file using specific features as the resolver
-# builds the graph as if all features are enabled:
-# https://doc.rust-lang.org/cargo/reference/resolver.html#features
-exclude = ["backward-compatibility", "backward-compatibility/generate-v0.11.0", "backward-compatibility/generate-v0.11.1", "backward-compatibility/generate-v0.13.0"]
 
 [workspace.package]
 authors = ["Zama"]
 publish = true
 edition = "2021"
+version = "1.0.0"
+homepage = "https://zama.ai/"
+build = "build.rs"
+repository = "https://github.com/zama-ai/threshold-fhe"
 license = "BSD-3-Clause-Clear"
-version = "0.13.0-rc.2"
-repository = "https://github.com/zama-ai/kms"
-description = "Key Management System for the Zama Protocol."
 
 [workspace.dependencies]
 # ⚠️ WORKSPACE DEPENDENCY MANAGEMENT BEST PRACTICES ⚠️
@@ -65,13 +46,9 @@ description = "Key Management System for the Zama Protocol."
 # MAINTAIN ALPHABETICAL ORDER for all dependencies within each section
 
 # Internal Zama modules
-backward-compatibility = { path = "./backward-compatibility" }  # Internal backward compatibility testing
 bc2wrap = { path = "./bc2wrap" }  # Internal bincode wrapper custom implementation
-kms = { path = "./core/service", default-features = false }  # Core KMS service
-kms-core-client = { path = "./core-client" }  # Core KMS client library
-kms-grpc = { path = "./core/grpc", default-features = false }  # KMS gRPC interface
 observability = { path = "./observability" }  # Internal observability module
-threshold-fhe = { path = "./core/threshold/", default-features = false }  # Threshold FHE implementation
+nexus = { path = "./nexus", default-features = false }  # Threshold FHE implementation
 
 # External dependencies (alphabetically sorted)
 aes = "=0.8.4"  # AES encryption - LOW RISK: RustCrypto org, very popular (135M+ downloads), actively maintained
@@ -88,7 +65,7 @@ assert_cmd = "=2.0.17"  # Assert command for testing - LOW RISK: assert-rs team,
 async-std = { version = "=1.13.1", features = ["attributes", "tokio1"] }  # Async runtime for testing - LOW RISK: async-rs team, 55M+ downloads
 async-trait = "=0.1.88"  # Async trait support -  MEDIUM RISK: Reputable individual maintainer (dtolnay), 292M downloads
 async_cell = "0.2.2"  # Async cell implementation - HIGH RISK: Individual maintainer, very low popularity
-attestation-doc-validation = { version = "=0.10.0" }  # AWS Nitro attestation validation - LOW RISK: Evervault (reputable security company), security-critical but trusted
+attestation-doc-validation = {git = 'https://github.com/mkmks/attestation-doc-validation.git', branch = 'timestamps' }  # AWS Nitro attestation validation - LOW RISK: Evervault (reputable security company), security-critical but trusted
 aws-config = { version = "=1.5.9" }  # AWS SDK configuration - LOW RISK: Official AWS SDK, actively maintained
 aws-nitro-enclaves-nsm-api = { version = "=0.4.0" }  # AWS Nitro Enclaves NSM API - LOW RISK: Official AWS SDK
 aws-sdk-kms = { version = "=1.50.0" }  # AWS KMS client - LOW RISK: Official AWS SDK for key management
@@ -161,12 +138,12 @@ rand = "=0.8.5"  # Random number generation - LOW RISK: rust-random, 100M+ downl
 rasn = "=0.20.2"  # ASN.1 encoding/decoding - HIGH RISK: Individual maintainer (XAMPPRocky), security-critical ASN.1 handling
 rasn-cms = "=0.20.2"  # CMS (Cryptographic Message Syntax) - HIGH RISK: Individual maintainer (XAMPPRocky), security-critical
 rayon = "=1.11.0"  # Data parallelism - LOW RISK: rayon-rs team
-rcgen = { version = "=0.14.0", default-features = false, features = ["aws_lc_rs", "crypto", "pem", "x509-parser"] }  # X.509 certificate generation - MEDIUM RISK: Using custom fork (see patch section), needs verification
+rcgen = { git = 'https://github.com/mkmks/rcgen.git', branch = 'k256', default-features = false, features = ["aws_lc_rs", "crypto", "pem", "x509-parser"] }  # X.509 certificate generation - MEDIUM RISK: Using custom fork (see patch section), needs verification
 redis = { version = "=0.29.5" }  # Redis client - LOW RISK: redis-rs team
 reqwest = { version = "=0.12.22", default-features = false, features = ["json", "rustls-tls"] }  # HTTP client - MEDIUM RISK: Reputable individual maintainer (seanmonstar, member of tokio org), 275M+ downloads
 rsa = { version = "=0.9.10", features = ["sha2", "serde"] }  # RSA public key cryptography - LOW RISK: RustCrypto org
 rstest = "=0.25.0"  # Test framework - HIGH RISK: Individual maintainer (la10736), test-only dependency
-rustls-webpki = { version = "=0.103.4", features = ["aws-lc-rs"] }  # WebPKI X.509 validation - LOW RISK: rustls team
+rustls-webpki = { git = 'https://github.com/mkmks/webpki.git', rev = '9ae056039fc1929cc7a3fc3036b71e50d82f2fe6', features = ["aws-lc-rs"] }  # WebPKI X.509 validation - LOW RISK: rustls team
 schemars = "=0.8.22"  # JSON Schema generation - HIGH RISK: Individual maintainer (GREsau), despite popularity, 81M+ downloads
 serde = { version = "1.0.226", features = ["derive", "rc"] }  # Serialization framework - MEDIUM RISK: Reputable individual maintainer (dtolnay), 641M downloads
 serde-wasm-bindgen = { version = "=0.6.5" }  # Serde integration for wasm-bindgen - HIGH RISK: Individual maintainer (RReverser), despite 37M+ downloads
@@ -188,7 +165,7 @@ tfhe-versionable = "=0.7.0"  # TFHE versioning support - LOW RISK: Zama
 tfhe-zk-pok = "=0.8.0"  # Zero-knowledge proofs for TFHE - LOW RISK: Zama
 thiserror = "=2.0.12"  # Error derive macro - MEDIUM RISK: Reputable individual maintainer (dtolnay), 545M downloads
 tokio = { version = "=1.46.1", features = ["full"] }  # Async runtime - LOW RISK: tokio team, industry standard
-tokio-rustls = { version = "=0.26.2", default-features = false, features = ["aws_lc_rs"] }  # Async TLS - LOW RISK: rustls team, memory-safe TLS implementation
+tokio-rustls = { git = 'https://github.com/mkmks/tokio-rustls.git', branch = 'k256', default-features = false, features = ["aws_lc_rs"] }  # Async TLS - LOW RISK: rustls team, memory-safe TLS implementation
 tokio-util = { version = "=0.7.15", features = ["rt"] }  # Tokio utilities - LOW RISK: tokio team
 tonic = "=0.13.1"  # gRPC framework - LOW RISK: hyperium team
 tonic-build = "=0.13.1"  # gRPC code generation - LOW RISK: hyperium team
@@ -244,12 +221,3 @@ lto = "fat"
 inherits = "release"
 # but set LTO to the default (off instead of fat)
 lto = "off"
-
-[patch.crates-io]
-# MEDIUM RISK: Using fork instead of upstream - verify changes, consider upstreaming
-attestation-doc-validation = { git = 'https://github.com/mkmks/attestation-doc-validation.git', branch = 'timestamps' }
-rcgen = { git = 'https://github.com/mkmks/rcgen.git', branch = 'k256' }
-rustls = { git = 'https://github.com/mkmks/rustls.git', branch = 'k256' }
-rustls-pki-types = { git = 'https://github.com/mkmks/pki-types.git', branch = 'k256' }
-rustls-webpki = { git = 'https://github.com/mkmks/webpki.git', branch = 'k256' }
-tokio-rustls = { git = 'https://github.com/mkmks/tokio-rustls.git', branch = 'k256' }
