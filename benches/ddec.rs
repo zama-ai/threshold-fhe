@@ -11,14 +11,14 @@ use threshold_fhe::{
     },
     execution::{
         constants::REAL_KEY_PATH,
-        endpoints::decryption::{threshold_decrypt64, DecryptionMode},
-        runtime::test_runtime::{generate_fixed_identities, DistributedTestRuntime},
+        endpoints::decryption::{threshold_decrypt64, DecryptionMode, RadixOrBoolCiphertext},
+        runtime::test_runtime::{generate_fixed_roles, DistributedTestRuntime},
         tfhe_internals::{
-            test_feature::{keygen_all_party_shares, KeySet},
+            test_feature::{keygen_all_party_shares_from_keyset, KeySet},
             utils::expanded_encrypt,
         },
     },
-    file_handling::read_element,
+    file_handling::tests::read_element,
     networking::NetworkMode,
 };
 
@@ -64,44 +64,36 @@ fn ddec_nsmall(c: &mut Criterion) {
     let mut rng = AesRng::from_entropy();
     for config in params {
         let message = rng.gen::<u64>();
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key.clone();
-        let params = keyset.sns_secret_key.params;
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            config.n,
-            config.t,
-        )
-        .unwrap();
+        let params = keyset.get_cpu_params().unwrap();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, config.n, config.t)
+                .unwrap();
         let ct: FheUint8 = expanded_encrypt(&keyset.public_keys.public_key, message, 8).unwrap();
-        let (raw_ct, _id, _tag) = ct.into_raw_parts();
+        let (raw_ct, _id, _tag, _rerand_metadata) = ct.into_raw_parts();
+        let raw_ct = RadixOrBoolCiphertext::Radix(raw_ct);
 
-        let identities = generate_fixed_identities(config.n);
+        let roles = generate_fixed_roles(config.n);
         //Using Sync because threshold_decrypt64 encompasses both online and offline
         let mut runtime = DistributedTestRuntime::<
             ResiduePolyF8Z128,
+            _,
             { ResiduePolyF8Z128::EXTENSION_DEGREE },
-        >::new(identities, config.t as u8, NetworkMode::Sync, None);
+        >::new(roles, config.t as u8, NetworkMode::Sync, None);
         let ctc = Arc::new(raw_ct);
 
-        let keyset_ck = Arc::new(keyset.public_keys.sns_key.clone().unwrap());
+        let server_key = Arc::new(keyset.public_keys.server_key.clone());
         let key_shares = Arc::new(key_shares);
-        runtime.conversion_keys = Some(keyset_ck.clone());
+        runtime.setup_server_key(server_key);
         runtime.setup_sks(key_shares.clone().to_vec());
 
         group.bench_with_input(
             BenchmarkId::from_parameter(config),
             &(config, ctc, runtime),
             |b, (_config, cti, runtime)| {
-                b.iter(|| {
-                    let _ =
-                        threshold_decrypt64(runtime, cti.as_ref(), DecryptionMode::NoiseFloodSmall);
-                });
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| {
+                        threshold_decrypt64(runtime, cti.as_ref(), DecryptionMode::NoiseFloodSmall)
+                    });
             },
         );
     }
@@ -128,41 +120,30 @@ fn ddec_bitdec_nsmall(c: &mut Criterion) {
     let mut rng = AesRng::from_entropy();
     for config in params {
         let message = rng.gen::<u64>();
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key.clone();
-        let params = keyset.sns_secret_key.params;
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            config.n,
-            config.t,
-        )
-        .unwrap();
+        let params = keyset.get_cpu_params().unwrap();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, config.n, config.t)
+                .unwrap();
         let ct: FheUint8 = expanded_encrypt(&keyset.public_keys.public_key, message, 8).unwrap();
-        let (raw_ct, _id, _tag) = ct.into_raw_parts();
+        let (raw_ct, _id, _tag, _rerand_metadata) = ct.into_raw_parts();
+        let raw_ct = RadixOrBoolCiphertext::Radix(raw_ct);
 
-        let identities = generate_fixed_identities(config.n);
+        let roles = generate_fixed_roles(config.n);
         let ctc = Arc::new(raw_ct);
         let key_shares = Arc::new(key_shares);
         //Using Sync because threshold_decrypt64 encompasses both online and offline
         let mut runtime = DistributedTestRuntime::<
             ResiduePolyF8Z64,
+            _,
             { ResiduePolyF8Z64::EXTENSION_DEGREE },
-        >::new(
-            identities.clone(), config.t as u8, NetworkMode::Sync, None
-        );
+        >::new(roles.clone(), config.t as u8, NetworkMode::Sync, None);
         runtime.setup_sks(key_shares.clone().to_vec());
         group.bench_with_input(
             BenchmarkId::from_parameter(config),
             &(config, ctc, runtime),
             |b, (_config, ct, runtime)| {
-                b.iter(|| {
-                    let _ = threshold_decrypt64(runtime, ct.as_ref(), DecryptionMode::BitDecSmall);
-                })
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| threshold_decrypt64(runtime, ct.as_ref(), DecryptionMode::BitDecSmall))
             },
         );
     }
@@ -188,45 +169,39 @@ fn ddec_nlarge(c: &mut Criterion) {
     let mut rng = AesRng::from_entropy();
     for config in params {
         let message = rng.gen::<u64>();
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key.clone();
-        let params = keyset.sns_secret_key.params;
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            config.n,
-            config.t,
-        )
-        .unwrap();
+        let params = keyset.get_cpu_params().unwrap();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, config.n, config.t)
+                .unwrap();
 
         let ct: FheUint8 = expanded_encrypt(&keyset.public_keys.public_key, message, 8).unwrap();
-        let (raw_ct, _id, _tag) = ct.into_raw_parts();
+        let (raw_ct, _id, _tag, _rerand_metadata) = ct.into_raw_parts();
+        let raw_ct = RadixOrBoolCiphertext::Radix(raw_ct);
 
-        let identities = generate_fixed_identities(config.n);
+        let roles = generate_fixed_roles(config.n);
         //Using Sync because threshold_decrypt64 encompasses both online and offline
         let mut runtime = DistributedTestRuntime::<
             ResiduePolyF8Z128,
+            _,
             { ResiduePolyF8Z128::EXTENSION_DEGREE },
-        >::new(identities, config.t as u8, NetworkMode::Sync, None);
+        >::new(roles, config.t as u8, NetworkMode::Sync, None);
 
         let ctc = Arc::new(raw_ct);
-        let conversion_key = Arc::new(keyset.public_keys.sns_key.clone().unwrap());
+
+        let server_key = Arc::new(keyset.public_keys.server_key.clone());
+        runtime.setup_server_key(server_key);
+
         let key_shares = Arc::new(key_shares);
-        runtime.setup_conversion_key(conversion_key.clone());
         runtime.setup_sks(key_shares.clone().to_vec());
 
         group.bench_with_input(
             BenchmarkId::from_parameter(config),
             &(config, ctc, runtime),
             |b, (_config, ct, runtime)| {
-                b.iter(|| {
-                    let _ =
-                        threshold_decrypt64(runtime, ct.as_ref(), DecryptionMode::NoiseFloodLarge);
-                });
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| {
+                        threshold_decrypt64(runtime, ct.as_ref(), DecryptionMode::NoiseFloodLarge)
+                    });
             },
         );
     }
@@ -253,38 +228,28 @@ fn ddec_bitdec_nlarge(c: &mut Criterion) {
     let mut rng = AesRng::from_entropy();
     for config in params {
         let message = rng.gen::<u64>();
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key.clone();
-        let params = keyset.sns_secret_key.params;
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            config.n,
-            config.t,
-        )
-        .unwrap();
+        let params = keyset.get_cpu_params().unwrap();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, config.n, config.t)
+                .unwrap();
 
         let ct: FheUint8 = expanded_encrypt(&keyset.public_keys.public_key, message, 8).unwrap();
-        let (raw_ct, _id, _tag) = ct.into_raw_parts();
+        let (raw_ct, _id, _tag, _rerand_metadata) = ct.into_raw_parts();
+        let raw_ct = RadixOrBoolCiphertext::Radix(raw_ct);
 
-        let identities = generate_fixed_identities(config.n);
+        let roles = generate_fixed_roles(config.n);
         let ctc = Arc::new(raw_ct);
         let key_shares = Arc::new(key_shares);
         let mut runtime =
         //Using Sync because threshold_decrypt64 encompasses both online and offline
-            DistributedTestRuntime::<ResiduePolyF8Z64,{ResiduePolyF8Z64::EXTENSION_DEGREE}>::new(identities.clone(), config.t as u8, NetworkMode::Sync, None);
+            DistributedTestRuntime::<ResiduePolyF8Z64, _, {ResiduePolyF8Z64::EXTENSION_DEGREE}>::new(roles.clone(), config.t as u8, NetworkMode::Sync, None);
         runtime.setup_sks(key_shares.clone().to_vec());
         group.bench_with_input(
             BenchmarkId::from_parameter(config),
             &(config, ctc, runtime),
             |b, (_config, ct, runtime)| {
-                b.iter(|| {
-                    let _ = threshold_decrypt64(runtime, ct.as_ref(), DecryptionMode::BitDecLarge);
-                })
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| threshold_decrypt64(runtime, ct.as_ref(), DecryptionMode::BitDecLarge))
             },
         );
     }

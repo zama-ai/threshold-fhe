@@ -6,9 +6,11 @@ use pprof::criterion::PProfProfiler;
 use rand::SeedableRng;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::num::Wrapping;
+use threshold_fhe::algebra::structure_traits::RingWithExceptionalSequence;
 use threshold_fhe::algebra::structure_traits::{FromU128, Sample};
-use threshold_fhe::execution::sharing::shamir::ShamirSharing;
+use threshold_fhe::execution::runtime::party::Role;
 use threshold_fhe::execution::sharing::shamir::{InputOp, RevealOp, ShamirFieldPoly};
+use threshold_fhe::execution::sharing::share::Share;
 use threshold_fhe::experimental::algebra::levels::LevelOne;
 use threshold_fhe::{
     algebra::{
@@ -33,21 +35,22 @@ fn bench_decode_z2(c: &mut Criterion) {
             }
 
             // f = a0 + ... + a_{t} * X^t
-            let f = ShamirFieldPoly { coefs };
+            let f = ShamirFieldPoly::from_coefs(coefs);
 
             // compute f(1),...,f(t+1)
             let party_ids: Vec<u8> = (1..2 * threshold + 2).map(|x| x as u8).collect();
 
             let shares: Vec<_> = party_ids
                 .iter()
-                .map(|x| ShamirSharing::<GF256> {
-                    share: f.eval(&GF256::from(*x)),
-                    party_id: *x,
+                .map(|x| {
+                    let party = Role::indexed_from_one(*x as usize);
+                    let point = f.eval(&GF256::embed_role_to_exceptional_sequence(&party).unwrap());
+                    Share::<GF256>::new(party, point)
                 })
                 .collect();
 
             b.iter(|| {
-                let secret_poly = error_correction(&shares, threshold, 0).unwrap();
+                let secret_poly = error_correction(shares.clone(), threshold, 0).unwrap();
                 assert_eq!(secret_poly, f);
             });
         });
@@ -116,10 +119,8 @@ fn bench_decode_par_z64(c: &mut Criterion) {
     for p in &params {
         for chunk_size in chunk_sizes {
             let (num_parties, threshold, max_err) = *p;
-            let p_str = format!(
-                "n:{num_parties} t:{threshold} e:{max_err} chunk_size:{:?}",
-                chunk_size
-            );
+            let p_str =
+                format!("n:{num_parties} t:{threshold} e:{max_err} chunk_size:{chunk_size:?}");
             assert!(num_parties >= (threshold + 1) + 2 * max_err);
 
             group.bench_function(BenchmarkId::new("decode", p_str), |b| {

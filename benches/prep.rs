@@ -5,14 +5,16 @@ use threshold_fhe::algebra::galois_rings::degree_8::ResiduePolyF8Z128;
 use threshold_fhe::algebra::galois_rings::degree_8::ResiduePolyF8Z64;
 use threshold_fhe::algebra::structure_traits::Ring;
 use threshold_fhe::execution::config::BatchParams;
-use threshold_fhe::execution::large_execution::double_sharing::DoubleSharing;
-use threshold_fhe::execution::large_execution::offline::LargePreprocessing;
-use threshold_fhe::execution::large_execution::offline::{TrueDoubleSharing, TrueSingleSharing};
-use threshold_fhe::execution::online::gen_bits::{BitGenEven, RealBitGenEven};
-use threshold_fhe::execution::runtime::session::{LargeSession, SmallSession128};
+use threshold_fhe::execution::large_execution::double_sharing::{
+    DoubleSharing, SecureDoubleSharing,
+};
+use threshold_fhe::execution::large_execution::offline::SecureLargePreprocessing;
+use threshold_fhe::execution::online::gen_bits::{BitGenEven, SecureBitGenEven};
+use threshold_fhe::execution::runtime::sessions::{
+    large_session::LargeSession, small_session::SmallSession128,
+};
 use threshold_fhe::execution::sharing::shamir::{InputOp, RevealOp};
-use threshold_fhe::execution::small_execution::agree_random::RealAgreeRandom;
-use threshold_fhe::execution::small_execution::offline::SmallPreprocessing;
+use threshold_fhe::execution::small_execution::offline::{Preprocessing, SecureSmallPreprocessing};
 use threshold_fhe::networking::NetworkMode;
 use threshold_fhe::tests::helper::tests_and_benches::execute_protocol_large;
 use threshold_fhe::tests::helper::tests_and_benches::execute_protocol_small;
@@ -67,12 +69,10 @@ fn triple_nsmall128(c: &mut Criterion) {
                                 randoms: 0,
                             };
 
-                            let _prep = SmallPreprocessing::<_, RealAgreeRandom>::init(
-                                &mut session,
-                                default_batch_size,
-                            )
-                            .await
-                            .unwrap();
+                            let _prep = SecureSmallPreprocessing::default()
+                                .execute(&mut session, default_batch_size)
+                                .await
+                                .unwrap();
                         };
                     //Executing offline, so require Sync network
                     let _result = execute_protocol_small::<
@@ -124,21 +124,16 @@ fn triple_z128(c: &mut Criterion) {
             |b, &config| {
                 b.iter(|| {
                     let mut computation = |mut session: LargeSession| async move {
-                        let _ = LargePreprocessing::<
-                            ResiduePolyF8Z128,
-                            TrueSingleSharing<ResiduePolyF8Z128>,
-                            TrueDoubleSharing<ResiduePolyF8Z128>,
-                        >::init(
-                            &mut session,
-                            BatchParams {
-                                triples: config.batch_size,
-                                randoms: 0,
-                            },
-                            TrueSingleSharing::default(),
-                            TrueDoubleSharing::default(),
-                        )
-                        .await
-                        .unwrap();
+                        let _ = SecureLargePreprocessing::<ResiduePolyF8Z128>::default()
+                            .execute(
+                                &mut session,
+                                BatchParams {
+                                    triples: config.batch_size,
+                                    randoms: 0,
+                                },
+                            )
+                            .await
+                            .unwrap();
                     };
                     //Executing offline, so require Sync network
                     let _result = execute_protocol_large::<
@@ -189,21 +184,16 @@ fn triple_z64(c: &mut Criterion) {
             |b, &config| {
                 b.iter(|| {
                     let mut computation = |mut session: LargeSession| async move {
-                        let _ = LargePreprocessing::<
-                            ResiduePolyF8Z64,
-                            TrueSingleSharing<ResiduePolyF8Z64>,
-                            TrueDoubleSharing<ResiduePolyF8Z64>,
-                        >::init(
-                            &mut session,
-                            BatchParams {
-                                triples: config.batch_size,
-                                randoms: 0,
-                            },
-                            TrueSingleSharing::default(),
-                            TrueDoubleSharing::default(),
-                        )
-                        .await
-                        .unwrap();
+                        let _ = SecureLargePreprocessing::<ResiduePolyF8Z64>::default()
+                            .execute(
+                                &mut session,
+                                BatchParams {
+                                    triples: config.batch_size,
+                                    randoms: 0,
+                                },
+                            )
+                            .await
+                            .unwrap();
                     };
                     //Executing offline, so require Sync network
                     let _result = execute_protocol_large::<
@@ -254,21 +244,16 @@ fn random_sharing(c: &mut Criterion) {
             |b, &config| {
                 b.iter(|| {
                     let mut computation = |mut session: LargeSession| async move {
-                        let _ = LargePreprocessing::<
-                            ResiduePolyF8Z128,
-                            TrueSingleSharing<ResiduePolyF8Z128>,
-                            TrueDoubleSharing<ResiduePolyF8Z128>,
-                        >::init(
-                            &mut session,
-                            BatchParams {
-                                triples: 0,
-                                randoms: config.batch_size,
-                            },
-                            TrueSingleSharing::default(),
-                            TrueDoubleSharing::default(),
-                        )
-                        .await
-                        .unwrap();
+                        let _ = SecureLargePreprocessing::<ResiduePolyF8Z128>::default()
+                            .execute(
+                                &mut session,
+                                BatchParams {
+                                    triples: 0,
+                                    randoms: config.batch_size,
+                                },
+                            )
+                            .await
+                            .unwrap();
                     };
                     //Executing offline, so require Sync network
                     let _result = execute_protocol_large::<
@@ -318,7 +303,7 @@ fn double_sharing(c: &mut Criterion) {
             |b, &config| {
                 b.iter(|| {
                     let mut computation = |mut session: LargeSession| async move {
-                        let mut dsh = TrueDoubleSharing::<ResiduePolyF8Z128>::default();
+                        let mut dsh = SecureDoubleSharing::<ResiduePolyF8Z128>::default();
                         dsh.init(&mut session, config.batch_size).await.unwrap();
                     };
                     //Executing offline, so require Sync network
@@ -369,22 +354,18 @@ fn bitgen_nlarge(c: &mut Criterion) {
             |b, &config| {
                 b.iter(|| {
                     let mut computation = |mut session: LargeSession| async move {
-                        let mut large_preprocessing = LargePreprocessing::<
-                            ResiduePolyF8Z128,
-                            TrueSingleSharing<ResiduePolyF8Z128>,
-                            TrueDoubleSharing<ResiduePolyF8Z128>,
-                        >::init(
-                            &mut session,
-                            BatchParams {
-                                triples: config.batch_size,
-                                randoms: config.batch_size,
-                            },
-                            TrueSingleSharing::default(),
-                            TrueDoubleSharing::default(),
-                        )
-                        .await
-                        .unwrap();
-                        let _ = RealBitGenEven::gen_bits_even(
+                        let mut large_preprocessing =
+                            SecureLargePreprocessing::<ResiduePolyF8Z128>::default()
+                                .execute(
+                                    &mut session,
+                                    BatchParams {
+                                        triples: config.batch_size,
+                                        randoms: config.batch_size,
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                        let _ = SecureBitGenEven::gen_bits_even(
                             config.batch_size,
                             &mut large_preprocessing,
                             &mut session,

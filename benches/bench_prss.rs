@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use aes_prng::AesRng;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -6,11 +6,19 @@ use rand::SeedableRng;
 use threshold_fhe::{
     algebra::galois_rings::degree_8::ResiduePolyF8Z128,
     execution::{
+        large_execution::vss::DummyVss,
         runtime::{
-            party::{Identity, Role},
-            session::{BaseSessionStruct, SessionParameters},
+            party::Role,
+            sessions::{
+                base_session::BaseSession,
+                session_parameters::{GenericParameterHandles, SessionParameters},
+            },
+            test_runtime::generate_fixed_roles,
         },
-        small_execution::{agree_random::DummyAgreeRandom, prss::PRSSSetup},
+        small_execution::{
+            agree_random::DummyAgreeRandomFromShare,
+            prss::{DerivePRSSState, PRSSInit, PRSSPrimitives, PRSSSetup, RobustRealPrssInit},
+        },
     },
     networking::{local::LocalNetworkingProducer, NetworkMode},
     session_id::SessionId,
@@ -29,18 +37,17 @@ fn bench_prss(c: &mut Criterion) {
     let mut sess = get_base_session_for_parties(
         num_parties,
         threshold,
-        Role::indexed_by_one(1),
+        Role::indexed_from_one(1),
         NetworkMode::Sync,
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
-    let prss = rt
+    let prss: PRSSSetup<ResiduePolyF8Z128> = rt
         .block_on(async {
-            PRSSSetup::<ResiduePolyF8Z128>::init_with_abort::<DummyAgreeRandom, AesRng, _>(
-                &mut sess,
-            )
-            .await
+            RobustRealPrssInit::<DummyAgreeRandomFromShare, DummyVss>::default()
+                .init(&mut sess)
+                .await
         })
         .unwrap();
 
@@ -50,7 +57,7 @@ fn bench_prss(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("prss_mask_next", size), |b| {
             b.iter(|| {
                 for _ in 0..*size {
-                    let _e_shares = state.mask_next(Role::indexed_by_one(1), 1_u128 << 70);
+                    let _e_shares = state.mask_next(Role::indexed_from_one(1), 1_u128 << 70);
                 }
             });
         });
@@ -62,13 +69,12 @@ pub fn get_base_session_for_parties(
     threshold: u8,
     role: Role,
     network_mode: NetworkMode,
-) -> BaseSessionStruct<AesRng, SessionParameters> {
+) -> BaseSession {
     let parameters = get_dummy_parameters_for_parties(amount, threshold, role);
-    let id = parameters.own_identity.clone();
-    let net_producer = LocalNetworkingProducer::from_ids(&[parameters.own_identity.clone()]);
-    BaseSessionStruct::new(
+    let net_producer = LocalNetworkingProducer::from_roles(parameters.roles());
+    BaseSession::new(
         parameters,
-        Arc::new(net_producer.user_net(id, network_mode, None)),
+        Arc::new(net_producer.user_net(role, network_mode, None)),
         AesRng::seed_from_u64(42),
     )
     .unwrap()
@@ -80,19 +86,13 @@ pub fn get_dummy_parameters_for_parties(
     role: Role,
 ) -> SessionParameters {
     assert!(amount > 0);
-    let mut role_assignment = HashMap::new();
-    for i in 0..amount {
-        role_assignment.insert(
-            Role::indexed_by_zero(i),
-            Identity(format!("localhost:{}", 5000 + i)),
-        );
-    }
-    SessionParameters {
+    SessionParameters::new(
         threshold,
-        session_id: SessionId(1),
-        own_identity: role_assignment.get(&role).unwrap().clone(),
-        role_assignments: role_assignment,
-    }
+        SessionId::from(1),
+        role,
+        generate_fixed_roles(amount),
+    )
+    .unwrap()
 }
 
 criterion_group!(prss, bench_prss);

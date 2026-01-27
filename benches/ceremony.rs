@@ -6,10 +6,10 @@ use threshold_fhe::{
     algebra::{galois_rings::degree_8::ResiduePolyF8Z64, structure_traits::Ring},
     execution::{
         runtime::{
-            session::ParameterHandles,
-            test_runtime::{generate_fixed_identities, DistributedTestRuntime},
+            sessions::session_parameters::GenericParameterHandles,
+            test_runtime::{generate_fixed_roles, DistributedTestRuntime},
         },
-        zk::ceremony::{Ceremony, RealCeremony},
+        zk::ceremony::{Ceremony, SecureCeremony},
     },
     networking::NetworkMode,
     session_id::SessionId,
@@ -31,36 +31,35 @@ fn bench_ceremony(c: &mut Criterion) {
             BenchmarkId::from_parameter(witness_dim),
             &witness_dim,
             |b, dim| {
-                let identities = generate_fixed_identities(num_parties);
+                let roles = generate_fixed_roles(num_parties);
                 //CRS generation requires sync network
                 let runtime: DistributedTestRuntime<
                     ResiduePolyF8Z64,
+                    _,
                     { ResiduePolyF8Z64::EXTENSION_DEGREE },
-                > = DistributedTestRuntime::new(
-                    identities,
-                    threshold as u8,
-                    NetworkMode::Sync,
-                    None,
-                );
+                > = DistributedTestRuntime::new(roles, threshold as u8, NetworkMode::Sync, None);
 
-                let session_id = SessionId(2);
+                let session_id = SessionId::from(2);
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let _guard = rt.enter();
 
                 b.iter(|| {
                     let mut set = JoinSet::new();
-                    for (index_id, _identity) in runtime.identities.clone().into_iter().enumerate()
-                    {
+                    let roles = runtime.roles.clone();
+                    for role in roles {
                         let dim = *dim;
-                        let mut session =
-                            runtime.small_session_for_party(session_id, index_id, None);
+                        let mut session = rt.block_on(async {
+                            runtime
+                                .small_session_for_party(session_id, role, None)
+                                .await
+                        });
                         set.spawn(async move {
-                            let real_ceremony = RealCeremony::default();
+                            let real_ceremony = SecureCeremony::default();
                             let out = real_ceremony
-                                .execute::<ResiduePolyF8Z64, _, _>(&mut session, dim, None)
+                                .execute::<ResiduePolyF8Z64, _>(&mut session, dim, None)
                                 .await
                                 .unwrap();
-                            (session.my_role().unwrap(), out)
+                            (session.my_role(), out)
                         });
                     }
 
@@ -75,7 +74,7 @@ fn bench_ceremony(c: &mut Criterion) {
                         })
                         .into_iter()
                         .collect_vec();
-                    let buf = bincode::serialize(&results[0].1).unwrap();
+                    let buf = bc2wrap::serialize(&results[0].1.inner).unwrap();
                     tracing::info!("crs bytes: {}", buf.len());
                 });
             },
