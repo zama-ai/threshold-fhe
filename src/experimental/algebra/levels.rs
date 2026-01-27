@@ -5,11 +5,10 @@ use crate::algebra::structure_traits::ErrorCorrect;
 use crate::algebra::structure_traits::FromU128;
 use crate::algebra::structure_traits::Invert;
 use crate::algebra::structure_traits::Ring;
-use crate::algebra::structure_traits::RingEmbed;
+use crate::algebra::structure_traits::RingWithExceptionalSequence;
 use crate::algebra::structure_traits::ZConsts;
 use crate::algebra::structure_traits::{Field, One, Sample, Zero};
 use crate::error::error_handler::anyhow_error_and_log;
-use crate::execution::sharing::shamir::ShamirSharing;
 use crate::execution::sharing::shamir::ShamirSharings;
 use crate::execution::sharing::share::Share;
 use crate::execution::small_execution::prf::PRSSConversions;
@@ -343,9 +342,22 @@ macro_rules! impl_field_level {
                 }
             }
 
-            impl RingEmbed for $name {
-                fn embed_exceptional_set(idx: usize) -> anyhow::Result<Self> {
-                    Ok(Self::from_u128(idx as u128))
+            impl RingWithExceptionalSequence for $name {
+                fn get_from_exceptional_sequence(idx: usize) -> anyhow::Result<Self> {
+                    let max_value : u128 = if Self::BIT_LENGTH < 128 {
+                        1 << Self::BIT_LENGTH
+                    }  else {
+                        u128::MAX // For larger bit lengths, we use a max value that fits in u128
+                    };
+
+                    let idx = idx as u128;
+                     if idx >= max_value {
+                        return Err(anyhow_error_and_log(
+                            format!("Index out of bounds for {} exceptional sequence", stringify!($name)),
+                        ));
+                    }
+
+                    Ok(Self::from_u128(idx))
                 }
             }
 
@@ -355,25 +367,16 @@ macro_rules! impl_field_level {
                     threshold: usize,
                     max_errs: usize,
                 ) -> anyhow::Result<Poly<$name>> {
-                    let shares: Vec<_> = sharing
-                        .shares
-                        .iter()
-                        .map(|share| ShamirSharing {
-                            share: share.value(),
-                            party_id: share.owner().one_based() as u8,
-                        })
-                        .collect();
-                    let res = error_correction(shares.as_slice(), threshold, max_errs)?;
-
-                    Ok(res)
+                    error_correction(sharing.shares.clone(), threshold, max_errs)
                 }
             }
             }
     };
 }
 
-impl RingEmbed for LevelKsw {
-    fn embed_exceptional_set(idx: usize) -> anyhow::Result<Self> {
+impl RingWithExceptionalSequence for LevelKsw {
+    // Field is big enough that we can use usize as index without any check
+    fn get_from_exceptional_sequence(idx: usize) -> anyhow::Result<Self> {
         Ok(Self::from_u128(idx as u128))
     }
 }
@@ -532,98 +535,114 @@ impl ErrorCorrect for LevelKsw {
         //Doing stuff in reverse order to get ownership with remove,
         //without having to pay for worst case complexity of moving all elements of the vector at every iteration
         for monomial_index in (0..=threshold).rev() {
-            let value_level_one = if res_level_one.coefs.len() - 1 == monomial_index {
-                res_level_one.coefs.remove(monomial_index)
+            let value_level_one = if res_level_one.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_one.pop().unwrap()
             } else {
                 LevelOne::ZERO
             };
 
-            let value_level_two = if res_level_two.coefs.len() - 1 == monomial_index {
-                res_level_two.coefs.remove(monomial_index)
+            let value_level_two = if res_level_two.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_two.pop().unwrap()
             } else {
                 LevelTwo::ZERO
             };
 
-            let value_level_three = if res_level_three.coefs.len() - 1 == monomial_index {
-                res_level_three.coefs.remove(monomial_index)
+            let value_level_three = if res_level_three.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_three.pop().unwrap()
             } else {
                 LevelThree::ZERO
             };
 
-            let value_level_four = if res_level_four.coefs.len() - 1 == monomial_index {
-                res_level_four.coefs.remove(monomial_index)
+            let value_level_four = if res_level_four.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_four.pop().unwrap()
             } else {
                 LevelFour::ZERO
             };
 
-            let value_level_five = if res_level_five.coefs.len() - 1 == monomial_index {
-                res_level_five.coefs.remove(monomial_index)
+            let value_level_five = if res_level_five.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_five.pop().unwrap()
             } else {
                 LevelFive::ZERO
             };
 
-            let value_level_six = if res_level_six.coefs.len() - 1 == monomial_index {
-                res_level_six.coefs.remove(monomial_index)
+            let value_level_six = if res_level_six.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_six.pop().unwrap()
             } else {
                 LevelSix::ZERO
             };
 
-            let value_level_seven = if res_level_seven.coefs.len() - 1 == monomial_index {
-                res_level_seven.coefs.remove(monomial_index)
+            let value_level_seven = if res_level_seven.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_seven.pop().unwrap()
             } else {
                 LevelSeven::ZERO
             };
 
-            let value_level_eight = if res_level_eight.coefs.len() - 1 == monomial_index {
-                res_level_eight.coefs.remove(monomial_index)
+            let value_level_eight = if res_level_eight.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_eight.pop().unwrap()
             } else {
                 LevelEight::ZERO
             };
 
-            let value_level_nine = if res_level_nine.coefs.len() - 1 == monomial_index {
-                res_level_nine.coefs.remove(monomial_index)
+            let value_level_nine = if res_level_nine.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_nine.pop().unwrap()
             } else {
                 LevelNine::ZERO
             };
 
-            let value_level_ten = if res_level_ten.coefs.len() - 1 == monomial_index {
-                res_level_ten.coefs.remove(monomial_index)
+            let value_level_ten = if res_level_ten.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_ten.pop().unwrap()
             } else {
                 LevelTen::ZERO
             };
 
-            let value_level_eleven = if res_level_eleven.coefs.len() - 1 == monomial_index {
-                res_level_eleven.coefs.remove(monomial_index)
+            let value_level_eleven = if res_level_eleven.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_eleven.pop().unwrap()
             } else {
                 LevelEleven::ZERO
             };
 
-            let value_level_twelve = if res_level_twelve.coefs.len() - 1 == monomial_index {
-                res_level_twelve.coefs.remove(monomial_index)
+            let value_level_twelve = if res_level_twelve.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_twelve.pop().unwrap()
             } else {
                 LevelTwelve::ZERO
             };
 
-            let value_level_thirteen = if res_level_thirteen.coefs.len() - 1 == monomial_index {
-                res_level_thirteen.coefs.remove(monomial_index)
+            let value_level_thirteen = if res_level_thirteen.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_thirteen.pop().unwrap()
             } else {
                 LevelThirteen::ZERO
             };
 
-            let value_level_fourteen = if res_level_fourteen.coefs.len() - 1 == monomial_index {
-                res_level_fourteen.coefs.remove(monomial_index)
+            let value_level_fourteen = if res_level_fourteen.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_fourteen.pop().unwrap()
             } else {
                 LevelFourteen::ZERO
             };
 
-            let value_level_fifteen = if res_level_fifteen.coefs.len() - 1 == monomial_index {
-                res_level_fifteen.coefs.remove(monomial_index)
+            let value_level_fifteen = if res_level_fifteen.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_fifteen.pop().unwrap()
             } else {
                 LevelFifteen::ZERO
             };
 
-            let value_level_r = if res_level_r.coefs.len() - 1 == monomial_index {
-                res_level_r.coefs.remove(monomial_index)
+            let value_level_r = if res_level_r.coefs().len() - 1 == monomial_index {
+                // SAFETY: length is checked before popping
+                res_level_r.pop().unwrap()
             } else {
                 LevelR::ZERO
             };
@@ -648,7 +667,7 @@ impl ErrorCorrect for LevelKsw {
             }))
         }
         coefs.reverse();
-        Ok(Poly { coefs })
+        Ok(Poly::from_coefs(coefs))
     }
 }
 
@@ -693,7 +712,7 @@ impl Invert for LevelKsw {
     fn invert(self) -> anyhow::Result<Self> {
         let inverse = self.value.0.inv_odd_mod(&Self::MODULUS);
         if inverse.is_none().into() {
-            Err(anyhow_error_and_log(format!("Could not invert {:?}", self)))
+            Err(anyhow_error_and_log(format!("Could not invert {self:?}")))
         } else {
             Ok(Self {
                 value: GenericModulus(inverse.unwrap()),
@@ -1053,11 +1072,11 @@ mod tests {
     use crate::algebra::poly::lagrange_interpolation;
     use crate::execution::config::BatchParams;
     use crate::execution::online::preprocessing::{RandomPreprocessing, TriplePreprocessing};
-    use crate::execution::runtime::session::SmallSession;
+    use crate::execution::runtime::party::Role;
+    use crate::execution::runtime::sessions::small_session::SmallSession;
     use crate::execution::sharing::shamir::{InputOp, RevealOp};
     use crate::execution::sharing::shamir::{ShamirFieldPoly, ShamirSharings};
-    use crate::execution::small_execution::agree_random::RealAgreeRandom;
-    use crate::execution::small_execution::offline::SmallPreprocessing;
+    use crate::execution::small_execution::offline::{Preprocessing, SecureSmallPreprocessing};
     use crate::networking::NetworkMode;
     use crate::tests::helper::tests_and_benches::execute_protocol_small;
     use aes_prng::AesRng;
@@ -1090,9 +1109,7 @@ mod tests {
 
     #[test]
     fn test_l1_poly_eval() {
-        let poly = Poly {
-            coefs: vec![LevelOne::from_u128(11), LevelOne::from_u128(1)],
-        };
+        let poly = Poly::from_coefs(vec![LevelOne::from_u128(11), LevelOne::from_u128(1)]);
         let xs = [LevelOne::from_u128(0), LevelOne::from_u128(1)];
         let ys: Vec<_> = xs.iter().map(|x| poly.eval(x)).collect();
         assert_eq!(ys[0], LevelOne::from_u128(11));
@@ -1113,15 +1130,13 @@ mod tests {
 
     #[test]
     fn test_l1_lagrange() {
-        let poly = Poly {
-            coefs: vec![
-                LevelOne::from_u128(11),
-                LevelOne::from_u128(2),
-                LevelOne::from_u128(3),
-                LevelOne::from_u128(22),
-                LevelOne::from_u128(9),
-            ],
-        };
+        let poly = Poly::from_coefs(vec![
+            LevelOne::from_u128(11),
+            LevelOne::from_u128(2),
+            LevelOne::from_u128(3),
+            LevelOne::from_u128(22),
+            LevelOne::from_u128(9),
+        ]);
         let xs = vec![
             LevelOne::from_u128(0),
             LevelOne::from_u128(1),
@@ -1140,30 +1155,29 @@ mod tests {
 
     #[test]
     fn test_field_reconstruct() {
-        let f = ShamirFieldPoly::<LevelOne> {
-            coefs: vec![
-                LevelOne::from_u128(12345),
-                LevelOne::from_u128(1234567),
-                LevelOne::from_u128(12345678910),
-            ],
-        };
+        let f = ShamirFieldPoly::<LevelOne>::from_coefs(vec![
+            LevelOne::from_u128(12345),
+            LevelOne::from_u128(1234567),
+            LevelOne::from_u128(12345678910),
+        ]);
 
         let num_parties = 7;
-        let threshold = f.coefs.len() - 1; // = 2 here
-        let max_err = (num_parties as usize - threshold) / 2; // = 2 here
+        let threshold = f.coefs().len() - 1; // = 2 here
+        let max_err = (num_parties - threshold) / 2; // = 2 here
 
         let mut shares: Vec<_> = (1..=num_parties)
-            .map(|x| ShamirSharing::<LevelOne> {
-                share: f.eval(&LevelOne::from_u128(x as u128)),
-                party_id: x,
+            .map(|x| {
+                let party = Role::indexed_from_one(x);
+                let point = f.eval(&LevelOne::embed_role_to_exceptional_sequence(&party).unwrap());
+                Share::<LevelOne>::new(party, point)
             })
             .collect();
 
         // modify shares of parties 1 and 2
-        shares[1].share += LevelOne::from_u128(10);
-        shares[2].share += LevelOne::from_u128(254);
+        shares[1] += LevelOne::from_u128(10);
+        shares[2] += LevelOne::from_u128(254);
 
-        let secret_poly = error_correction(&shares, threshold, max_err).unwrap();
+        let secret_poly = error_correction(shares, threshold, max_err).unwrap();
         assert_eq!(secret_poly, f);
     }
 
@@ -1204,8 +1218,8 @@ mod tests {
         assert_eq!(f_zero, secret);
     }
 
-    #[test]
-    fn test_levelksw_triple_gen() {
+    #[tokio::test]
+    async fn test_levelksw_triple_gen() {
         let parties = 5;
         let threshold = 1;
         let mut task = |mut session: SmallSession<LevelKsw>, _bot: Option<String>| async move {
@@ -1214,10 +1228,10 @@ mod tests {
                 randoms: 100,
             };
 
-            let mut prep =
-                SmallPreprocessing::<LevelKsw, RealAgreeRandom>::init(&mut session, batch_size)
-                    .await
-                    .unwrap();
+            let mut prep = SecureSmallPreprocessing::default()
+                .execute(&mut session, batch_size)
+                .await
+                .unwrap();
             (
                 prep.next_triple_vec(100).unwrap(),
                 prep.next_random_vec(100).unwrap(),
@@ -1232,7 +1246,8 @@ mod tests {
             None,
             &mut task,
             None,
-        );
+        )
+        .await;
 
         //Reconstruct everything and check triples are triples
         for idx in 0..100 {

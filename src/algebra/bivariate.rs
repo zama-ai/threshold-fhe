@@ -5,6 +5,7 @@ use super::structure_traits::Sample;
 use super::structure_traits::Zero;
 use crate::error::error_handler::anyhow_error_and_log;
 use anyhow::Result;
+use itertools::Itertools;
 use ndarray::Array;
 use ndarray::ArrayD;
 use ndarray::IxDyn;
@@ -68,14 +69,20 @@ impl<Z: Ring> MatrixMul<Z> for ArrayD<Z> {
         match (self.ndim(), rhs.ndim()) {
             (1, 1) => {
                 if self.dim() != rhs.dim() {
-                    Err(anyhow_error_and_log(format!("Cannot compute multiplication between rank 1 tensor where dimension of lhs {:?} and rhs {:?}", self.dim(), rhs.dim())))
-                } else {
-                    let res = self
-                        .iter()
-                        .zip(rhs)
-                        .fold(Z::ZERO, |acc, (a, b)| acc + *a * *b);
-                    Ok(Array::from_elem(IxDyn(&[1]), res).into_dyn())
+                    return  Err(anyhow_error_and_log(format!("Cannot compute multiplication between rank 1 tensor where dimension of lhs {:?} and rhs {:?}", self.dim(), rhs.dim())));
                 }
+                if self.len() != rhs.len() {
+                    return Err(anyhow_error_and_log(format!(
+                        "Cannot multiply lhs of {:?} elements and rhs of {:?} elements for rank 1 tensors",
+                        self.len(),
+                        rhs.len()
+                    )));
+                }
+                let res = self
+                    .iter()
+                    .zip_eq(rhs)
+                    .fold(Z::ZERO, |acc, (a, b)| acc + *a * *b);
+                Ok(Array::from_elem(IxDyn(&[1]), res).into_dyn())
             }
             (1, 2) => {
                 if self.dim()[0] != rhs.dim()[0] {
@@ -83,9 +90,16 @@ impl<Z: Ring> MatrixMul<Z> for ArrayD<Z> {
                 } else {
                     let mut res = Vec::new();
                     for col in rhs.columns() {
+                        if col.len() != self.len() {
+                            return Err(anyhow_error_and_log(format!(
+                                "Cannot multiply lhs of {:?} elements and rhs of {:?} elements for rank 1 tensors and rank 2 tensors",
+                                self.len(),
+                                rhs.len()
+                            )));
+                        }
                         let s = col
                             .iter()
-                            .zip(self)
+                            .zip_eq(self)
                             .fold(Z::ZERO, |acc, (a, b)| acc + *b * *a);
                         res.push(s);
                     }
@@ -98,9 +112,16 @@ impl<Z: Ring> MatrixMul<Z> for ArrayD<Z> {
                 } else {
                     let mut res = Vec::new();
                     for row in self.rows() {
+                        if row.len() != rhs.len() {
+                            return Err(anyhow_error_and_log(format!(
+                                "Cannot multiply lhs of {:?} elements and rhs of {:?} elements for rank 2 tensors and rank 1 tensors",
+                                self.len(),
+                                rhs.len()
+                            )));
+                        }
                         let s = row
                             .iter()
-                            .zip(rhs)
+                            .zip_eq(rhs)
                             .fold(Z::ZERO, |acc, (a, b)| acc + *b * *a);
                         res.push(s);
                     }
@@ -108,8 +129,7 @@ impl<Z: Ring> MatrixMul<Z> for ArrayD<Z> {
                 }
             }
             (l_rank, r_rank) => Err(anyhow_error_and_log(format!(
-                "Matmul not implemented for tensors of rank {:?}, {:?}",
-                l_rank, r_rank,
+                "Matmul not implemented for tensors of rank {l_rank:?}, {r_rank:?}",
             ))),
         }
     }
@@ -602,70 +622,68 @@ mod tests {
         let (bpoly, point) = poly_setup();
         let res = bpoly.partial_x_evaluation(point).unwrap();
 
-        let expected_result = Poly::<ResiduePolyF8Z128> {
-            coefs: vec![
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(194659304737652150274621743969329712438_u128),
-                        Wrapping(115685945677868204172585339280717591321_u128),
-                        Wrapping(169699422973071654346792619067607866670_u128),
-                        Wrapping(321100274427556339261468557161987205751_u128),
-                        Wrapping(195462117064886035019009854572906963164_u128),
-                        Wrapping(291339002808732288285336967010694614055_u128),
-                        Wrapping(227667236883020811656236216622638022479_u128),
-                        Wrapping(111107134209136259497829196880415286861_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(147454880481104232835922501791269260818_u128),
-                        Wrapping(65465170413206610326920172544645541174_u128),
-                        Wrapping(93236257691904232563708805938564129299_u128),
-                        Wrapping(155706651091356865905198284014665420963_u128),
-                        Wrapping(191853049678401528554852500058265028133_u128),
-                        Wrapping(169352184245891491494444673534070536232_u128),
-                        Wrapping(138875474704417926564925414355672698438_u128),
-                        Wrapping(62042910943958481560375824830383748680_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                    ],
-                },
-            ],
-        };
+        let expected_result = Poly::<ResiduePolyF8Z128>::from_coefs(vec![
+            ResiduePoly {
+                coefs: [
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(194659304737652150274621743969329712438_u128),
+                    Wrapping(115685945677868204172585339280717591321_u128),
+                    Wrapping(169699422973071654346792619067607866670_u128),
+                    Wrapping(321100274427556339261468557161987205751_u128),
+                    Wrapping(195462117064886035019009854572906963164_u128),
+                    Wrapping(291339002808732288285336967010694614055_u128),
+                    Wrapping(227667236883020811656236216622638022479_u128),
+                    Wrapping(111107134209136259497829196880415286861_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(147454880481104232835922501791269260818_u128),
+                    Wrapping(65465170413206610326920172544645541174_u128),
+                    Wrapping(93236257691904232563708805938564129299_u128),
+                    Wrapping(155706651091356865905198284014665420963_u128),
+                    Wrapping(191853049678401528554852500058265028133_u128),
+                    Wrapping(169352184245891491494444673534070536232_u128),
+                    Wrapping(138875474704417926564925414355672698438_u128),
+                    Wrapping(62042910943958481560375824830383748680_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                ],
+            },
+        ]);
 
         assert_eq!(res, expected_result);
     }
@@ -678,70 +696,68 @@ mod tests {
         let (bpoly, point) = poly_setup();
         let res = bpoly.partial_y_evaluation(point).unwrap();
 
-        let expected_result = Poly::<ResiduePolyF8Z128> {
-            coefs: vec![
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(201011427321774599482568837072770222480_u128),
-                        Wrapping(11947668628466305484845266609591726489_u128),
-                        Wrapping(69450643145791245497886627400193290916_u128),
-                        Wrapping(52602571092206009467823484151543166903_u128),
-                        Wrapping(224549574104317112479612329539181369785_u128),
-                        Wrapping(237188827600534885306506803777179132832_u128),
-                        Wrapping(337746828579109619160145562864273140551_u128),
-                        Wrapping(194794966634209513665432034913002287282_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(15534540341544077333485629482685556983_u128),
-                        Wrapping(102137375687280591904357361381864283910_u128),
-                        Wrapping(313193850724129059476368899766085275886_u128),
-                        Wrapping(184445872102471941817162671172157093385_u128),
-                        Wrapping(145892334667775198680982773891695966711_u128),
-                        Wrapping(12035224209516384700884015529761895359_u128),
-                        Wrapping(127420874420047592073367830265565440284_u128),
-                        Wrapping(83363095314314986646908258467169833274_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(6789996746804626888188836103074992860_u128),
-                        Wrapping(224144536684548159123994093745570895575_u128),
-                        Wrapping(86263644680843427503974616985670812760_u128),
-                        Wrapping(177963489535853129498538648878873325825_u128),
-                        Wrapping(44380349963576940170581732126952083169_u128),
-                        Wrapping(223903890258473843424549423845416822781_u128),
-                        Wrapping(101855678291082912034572954513892058977_u128),
-                        Wrapping(103425740087765622108029333800331006686_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(125282582454093692796288940448287589127_u128),
-                        Wrapping(156583199810545222234926477955564404552_u128),
-                        Wrapping(53976853057841824456213450153642528974_u128),
-                        Wrapping(261904549797046130835127155153696559898_u128),
-                        Wrapping(191933233286381918543285561179452794417_u128),
-                        Wrapping(58025913687275085976380380921341802375_u128),
-                        Wrapping(157727573697178459210200091732618328865_u128),
-                        Wrapping(79355704402495352443477030202615414328_u128),
-                    ],
-                },
-                ResiduePoly {
-                    coefs: [
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                        Wrapping(0_u128),
-                    ],
-                },
-            ],
-        };
+        let expected_result = Poly::<ResiduePolyF8Z128>::from_coefs(vec![
+            ResiduePoly {
+                coefs: [
+                    Wrapping(201011427321774599482568837072770222480_u128),
+                    Wrapping(11947668628466305484845266609591726489_u128),
+                    Wrapping(69450643145791245497886627400193290916_u128),
+                    Wrapping(52602571092206009467823484151543166903_u128),
+                    Wrapping(224549574104317112479612329539181369785_u128),
+                    Wrapping(237188827600534885306506803777179132832_u128),
+                    Wrapping(337746828579109619160145562864273140551_u128),
+                    Wrapping(194794966634209513665432034913002287282_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(15534540341544077333485629482685556983_u128),
+                    Wrapping(102137375687280591904357361381864283910_u128),
+                    Wrapping(313193850724129059476368899766085275886_u128),
+                    Wrapping(184445872102471941817162671172157093385_u128),
+                    Wrapping(145892334667775198680982773891695966711_u128),
+                    Wrapping(12035224209516384700884015529761895359_u128),
+                    Wrapping(127420874420047592073367830265565440284_u128),
+                    Wrapping(83363095314314986646908258467169833274_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(6789996746804626888188836103074992860_u128),
+                    Wrapping(224144536684548159123994093745570895575_u128),
+                    Wrapping(86263644680843427503974616985670812760_u128),
+                    Wrapping(177963489535853129498538648878873325825_u128),
+                    Wrapping(44380349963576940170581732126952083169_u128),
+                    Wrapping(223903890258473843424549423845416822781_u128),
+                    Wrapping(101855678291082912034572954513892058977_u128),
+                    Wrapping(103425740087765622108029333800331006686_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(125282582454093692796288940448287589127_u128),
+                    Wrapping(156583199810545222234926477955564404552_u128),
+                    Wrapping(53976853057841824456213450153642528974_u128),
+                    Wrapping(261904549797046130835127155153696559898_u128),
+                    Wrapping(191933233286381918543285561179452794417_u128),
+                    Wrapping(58025913687275085976380380921341802375_u128),
+                    Wrapping(157727573697178459210200091732618328865_u128),
+                    Wrapping(79355704402495352443477030202615414328_u128),
+                ],
+            },
+            ResiduePoly {
+                coefs: [
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                    Wrapping(0_u128),
+                ],
+            },
+        ]);
         assert_eq!(res, expected_result);
     }
 

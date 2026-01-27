@@ -4,26 +4,33 @@ use super::triple::Triple;
 use crate::algebra::base_ring::{Z128, Z64};
 use crate::algebra::galois_rings::common::ResiduePoly;
 use crate::algebra::structure_traits::{ErrorCorrect, Invert, Solve};
+use crate::execution::constants::{B_SWITCH_SQUASH, LOG_B_SWITCH_SQUASH, STATSEC};
 use crate::execution::keyset_config::KeySetConfig;
-use crate::execution::online::preprocessing::memory::memory_factory;
-use crate::execution::runtime::session::{BaseSession, SmallSession};
-use crate::execution::tfhe_internals::parameters::{DKGParams, NoiseBounds};
+use crate::execution::online::gen_bits::{BitGenEven, SecureBitGenEven};
+use crate::execution::online::preprocessing::memory::{memory_factory, InMemoryBitPreprocessing};
+use crate::execution::runtime::sessions::session_parameters::GenericParameterHandles;
+use crate::execution::runtime::sessions::{base_session::BaseSession, small_session::SmallSession};
+use crate::execution::small_execution::prss::PRSSPrimitives;
+use crate::execution::tfhe_internals::parameters::{DKGParams, NoiseBounds, TUniformBound};
 use crate::{
     algebra::structure_traits::Ring, error::error_handler::anyhow_error_and_log,
     execution::sharing::share::Share,
 };
+use itertools::Itertools;
 
 use async_trait::async_trait;
 use mockall::{automock, mock};
-
 #[automock]
 /// Trait that a __store__ for shares of multiplication triples ([`Triple`]) needs to implement.
 pub trait TriplePreprocessing<Z: Clone + Send + Sync>: Send + Sync {
     /// Outputs share of a random triple
     fn next_triple(&mut self) -> anyhow::Result<Triple<Z>> {
-        self.next_triple_vec(1)?
-            .pop()
-            .ok_or_else(|| anyhow_error_and_log("Error accessing 0th triple".to_string()))
+        if self.triples_len() == 0 {
+            return Err(anyhow_error_and_log("No triples available".to_string()));
+        }
+        // We unwrap here because we know that the next_triple_vec will return one triple
+        // as we just checked the length
+        Ok(self.next_triple_vec(1).unwrap().pop().unwrap())
     }
 
     /// Outputs a vector of shares of random triples
@@ -39,9 +46,13 @@ pub trait TriplePreprocessing<Z: Clone + Send + Sync>: Send + Sync {
 pub trait RandomPreprocessing<Z: Clone> {
     /// Outputs share of a uniformly random element of the [`Ring`]
     fn next_random(&mut self) -> anyhow::Result<Share<Z>> {
-        self.next_random_vec(1)?
-            .pop()
-            .ok_or_else(|| anyhow_error_and_log("Error accessing 0th randomness".to_string()))
+        if self.randoms_len() == 0 {
+            return Err(anyhow_error_and_log("No randomness available".to_string()));
+        }
+
+        // We unwrap here because we know that the next_random_vec will return one triple
+        // as we just checked the length
+        Ok(self.next_random_vec(1).unwrap().pop().unwrap())
     }
 
     /// Constructs a vector of shares of uniformly random elements of the [`Ring`]
@@ -88,7 +99,7 @@ pub trait BitPreprocessing<Z: Clone>: Send + Sync {
 /// InMemory type that implement the [`BitDecPreprocessing`]
 /// Trait. Put here because the trait requires being able to
 /// cast to this struct
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct InMemoryBitDecPreprocessing<const EXTENSION_DEGREE: usize> {
     available_triples: Vec<Triple<ResiduePoly<Z64, EXTENSION_DEGREE>>>,
     available_bits: Vec<Share<ResiduePoly<Z64, EXTENSION_DEGREE>>>,
@@ -135,7 +146,7 @@ pub trait BitDecPreprocessing<const EXTENSION_DEGREE: usize>:
 #[async_trait]
 pub trait NoiseFloodPreprocessing<const EXTENSION_DEGREE: usize>: Send + Sync
 where
-    ResiduePoly<Z128, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z128, EXTENSION_DEGREE>: Invert + Solve + ErrorCorrect,
 {
     fn append_masks(&mut self, masks: Vec<ResiduePoly<Z128, EXTENSION_DEGREE>>);
     fn next_mask(&mut self) -> anyhow::Result<ResiduePoly<Z128, EXTENSION_DEGREE>>;
@@ -145,11 +156,21 @@ where
     ) -> anyhow::Result<Vec<ResiduePoly<Z128, EXTENSION_DEGREE>>>;
 
     /// Fill the masks directly from the [`crate::execution::small_execution::prss::PRSSState`] available from [`SmallSession`]
-    fn fill_from_small_session(
+    async fn fill_from_small_session(
         &mut self,
         session: &mut SmallSession<ResiduePoly<Z128, EXTENSION_DEGREE>>,
         amount: usize,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<()> {
+        let own_role = session.my_role();
+
+        let masks = session
+            .prss_state
+            .mask_next_vec(own_role, B_SWITCH_SQUASH, amount)
+            .await?;
+        self.append_masks(masks);
+
+        Ok(())
+    }
 
     /// Fill the masks by first generating bits via triples and randomness provided by [`BasePreprocessing`]
     async fn fill_from_base_preproc(
@@ -157,7 +178,15 @@ where
         preprocessing: &mut dyn BasePreprocessing<ResiduePoly<Z128, EXTENSION_DEGREE>>,
         session: &mut BaseSession,
         num_ctxts: usize,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<()> {
+        let bound_d = (STATSEC + LOG_B_SWITCH_SQUASH) as usize;
+        let num_bits = 2 * num_ctxts * (bound_d + 2);
+        let available_bits =
+            SecureBitGenEven::gen_bits_even(num_bits, preprocessing, session).await?;
+        let mut bit_preproc = InMemoryBitPreprocessing { available_bits };
+
+        self.fill_from_bits_preproc(&mut bit_preproc, num_ctxts)
+    }
 
     /// Fill the masks directly from available bits provided by [`BitPreprocessing`],
     /// using [`crate::execution::online::secret_distributions::SecretDistributions`]
@@ -165,7 +194,17 @@ where
         &mut self,
         bit_preproc: &mut dyn BitPreprocessing<ResiduePoly<Z128, EXTENSION_DEGREE>>,
         num_ctxts: usize,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<()> {
+        let bound_d = (STATSEC + LOG_B_SWITCH_SQUASH) as usize;
+        self.append_masks(
+            RealSecretDistributions::t_uniform(2 * num_ctxts, TUniformBound(bound_d), bit_preproc)?
+                .into_iter()
+                .tuples()
+                .map(|(a, b)| a.value() + b.value())
+                .collect(),
+        );
+        Ok(())
+    }
 }
 
 impl NoiseBounds {
@@ -176,6 +215,9 @@ impl NoiseBounds {
             NoiseBounds::GlweNoise(_) => CorrelatedRandomnessType::NoiseGlwe,
             NoiseBounds::GlweNoiseSnS(_) => CorrelatedRandomnessType::NoiseGlweSnS,
             NoiseBounds::CompressionKSKNoise(_) => CorrelatedRandomnessType::NoiseCompressionKSK,
+            NoiseBounds::SnsCompressionKSKNoise(_) => {
+                CorrelatedRandomnessType::SnsNoiseCompressionKSK
+            }
         }
     }
 }
@@ -257,7 +299,7 @@ pub(crate) fn dkg_fill_from_triples_and_bit_preproc<Z: Ring>(
     // Generate noise needed for compression key
     let ksk_noise = params_basics_handles.all_compression_ksk_noise(keyset_config);
     prep.append_noises(
-        RealSecretDistributions::from_noise_info(ksk_noise.clone(), preprocessing_bits)?,
+        RealSecretDistributions::from_noise_info(ksk_noise, preprocessing_bits)?,
         ksk_noise.bound,
     );
 
@@ -275,6 +317,22 @@ pub(crate) fn dkg_fill_from_triples_and_bit_preproc<Z: Ring>(
             }
             DKGParams::WithoutSnS(_) => (),
         }
+    }
+
+    // Generate noise for sns compression key if needed
+    match keyset_config {
+        KeySetConfig::Standard(_) => match params {
+            DKGParams::WithSnS(sns_params) => {
+                let noise_info = sns_params.num_needed_noise_sns_compression_key();
+                let bound = noise_info.bound;
+                prep.append_noises(
+                    RealSecretDistributions::from_noise_info(noise_info, preprocessing_bits)?,
+                    bound,
+                );
+            }
+            DKGParams::WithoutSnS(_) => (),
+        },
+        KeySetConfig::DecompressionOnly => {}
     }
 
     //Generate noise needed for the pk
@@ -359,6 +417,45 @@ pub(crate) mod memory;
 pub mod orchestration;
 pub mod redis;
 
+// The non_local_effect_before_error_return lint complains
+// about as_mut() calls but I believe that's a false positive.
+
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
+impl<Z: Clone + Send + Sync> RandomPreprocessing<Z> for Box<dyn BasePreprocessing<Z>> {
+    fn next_random_vec(&mut self, amount: usize) -> anyhow::Result<Vec<Share<Z>>> {
+        self.as_mut().next_random_vec(amount)
+    }
+
+    fn append_randoms(&mut self, randoms: Vec<Share<Z>>) {
+        self.as_mut().append_randoms(randoms)
+    }
+
+    fn randoms_len(&self) -> usize {
+        self.as_ref().randoms_len()
+    }
+}
+
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
+impl<Z: Clone + Send + Sync> TriplePreprocessing<Z> for Box<dyn BasePreprocessing<Z>> {
+    fn next_triple_vec(&mut self, amount: usize) -> anyhow::Result<Vec<Triple<Z>>> {
+        self.as_mut().next_triple_vec(amount)
+    }
+
+    fn append_triples(&mut self, triples: Vec<Triple<Z>>) {
+        self.as_mut().append_triples(triples)
+    }
+
+    fn triples_len(&self) -> usize {
+        self.as_ref().triples_len()
+    }
+}
+
+impl<Z: Clone + Send + Sync> BasePreprocessing<Z> for Box<dyn BasePreprocessing<Z>> {}
+
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
 impl<Z: Clone + Send + Sync> TriplePreprocessing<Z> for Box<dyn DKGPreprocessing<Z>> {
     fn next_triple_vec(&mut self, amount: usize) -> anyhow::Result<Vec<Triple<Z>>> {
         self.as_mut().next_triple_vec(amount)
@@ -373,6 +470,8 @@ impl<Z: Clone + Send + Sync> TriplePreprocessing<Z> for Box<dyn DKGPreprocessing
     }
 }
 
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
 impl<Z: Clone + Send + Sync> RandomPreprocessing<Z> for Box<dyn DKGPreprocessing<Z>> {
     fn next_random_vec(&mut self, amount: usize) -> anyhow::Result<Vec<Share<Z>>> {
         self.as_mut().next_random_vec(amount)
@@ -389,6 +488,8 @@ impl<Z: Clone + Send + Sync> RandomPreprocessing<Z> for Box<dyn DKGPreprocessing
 
 impl<Z: Clone + Send + Sync> BasePreprocessing<Z> for Box<dyn DKGPreprocessing<Z>> {}
 
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
 impl<Z: Clone + Send + Sync> BitPreprocessing<Z> for Box<dyn DKGPreprocessing<Z>> {
     fn append_bits(&mut self, bits: Vec<Share<Z>>) {
         self.as_mut().append_bits(bits)
@@ -404,6 +505,8 @@ impl<Z: Clone + Send + Sync> BitPreprocessing<Z> for Box<dyn DKGPreprocessing<Z>
     }
 }
 
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
 #[async_trait]
 impl<Z: Ring> DKGPreprocessing<Z> for Box<dyn DKGPreprocessing<Z>> {
     fn append_noises(&mut self, noises: Vec<Share<Z>>, bound: NoiseBounds) {

@@ -1,6 +1,7 @@
 use crate::error::error_handler::anyhow_error_and_log;
 use crate::execution::runtime::party::Role;
-use crate::execution::runtime::session::BaseSessionHandles;
+use crate::execution::runtime::sessions::base_session::BaseSessionHandles;
+use crate::execution::runtime::sessions::session_parameters::DeSerializationRunTime;
 use crate::execution::sharing::share::Share;
 use crate::experimental::algebra::levels::LevelEll;
 use crate::experimental::algebra::levels::LevelKsw;
@@ -14,8 +15,6 @@ use crate::experimental::constants::PLAINTEXT_MODULUS;
 use crate::networking::value::NetworkValue;
 use aes_prng::AesRng;
 use itertools::Itertools;
-use rand::CryptoRng;
-use rand::Rng;
 use rand::SeedableRng;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -30,13 +29,14 @@ pub(crate) fn gen_key_set() -> (PublicBgvKeySet, SecretKey) {
     (pk, sk)
 }
 
-pub async fn transfer_pub_key<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
+pub async fn transfer_pub_key<S: BaseSessionHandles>(
     session: &S,
     pubkey: Option<PublicBgvKeySet>,
     role: &Role,
     input_party_id: usize,
 ) -> anyhow::Result<PublicBgvKeySet> {
-    session.network().increase_round_counter()?;
+    let deserialization_runtime = DeSerializationRunTime::Rayon;
+    session.network().increase_round_counter().await;
     if role.one_based() == input_party_id {
         let pubkey_raw =
             pubkey.ok_or_else(|| anyhow_error_and_log("I have no public key to send!"))?;
@@ -44,36 +44,39 @@ pub async fn transfer_pub_key<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
 
         let pkval = NetworkValue::<LevelEll>::PubBgvKeySet(Box::new(pubkey_raw.clone()));
         tracing::debug!("Sending pk to all other parties");
+        let send_pk = Arc::new(pkval.to_network());
 
         let mut set = JoinSet::new();
         for to_send_role in 1..=num_parties {
             if to_send_role != input_party_id {
-                let identity = session.identity_from(&Role::indexed_by_one(to_send_role))?;
-
                 let networking = Arc::clone(session.network());
-                let send_pk = pkval.clone();
 
+                let send_pk = Arc::clone(&send_pk);
                 set.spawn(async move {
-                    let _ = networking.send(send_pk.to_network(), &identity).await;
+                    let _ = networking
+                        .send(send_pk, &Role::indexed_from_one(to_send_role))
+                        .await;
                 });
             }
         }
         while (set.join_next().await).is_some() {}
         Ok(pubkey_raw)
     } else {
-        let receiver = session.identity_from(&Role::indexed_by_one(input_party_id))?;
         let networking = Arc::clone(session.network());
-        let timeout = session.network().get_timeout_current_round()?;
+        let timeout = session.network().get_timeout_current_round().await;
         tracing::debug!(
             "Waiting for receiving public key from input party with timeout {:?}",
             timeout
         );
         let data = tokio::spawn(timeout_at(timeout, async move {
-            networking.receive(&receiver).await
+            networking
+                .receive(&Role::indexed_from_one(input_party_id))
+                .await
         }))
         .await??;
 
-        let pk = match NetworkValue::<LevelEll>::from_network(data)? {
+        let pk = match NetworkValue::<LevelEll>::from_network(data, deserialization_runtime).await?
+        {
             NetworkValue::PubBgvKeySet(pk) => pk,
             _ => Err(anyhow_error_and_log(
                 "I have received sth different from a public key!",
@@ -84,12 +87,13 @@ pub async fn transfer_pub_key<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
     }
 }
 
-pub async fn transfer_secret_key<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
+pub async fn transfer_secret_key<S: BaseSessionHandles>(
     session: &mut S,
     secret_key: Option<SecretKey>,
     role: &Role,
     input_party_id: usize,
 ) -> anyhow::Result<PrivateBgvKeySet> {
+    let deserialization_runtime = DeSerializationRunTime::Rayon;
     let num_parties = session.num_parties();
     let threshold = session.threshold();
 
@@ -99,8 +103,7 @@ pub async fn transfer_secret_key<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
 
         let mut set = JoinSet::new();
         for (to_send_role, sk) in ks.iter().enumerate() {
-            if to_send_role != role.zero_based() {
-                let identity = session.identity_from(&Role::indexed_by_zero(to_send_role))?;
+            if to_send_role + 1 != role.one_based() {
                 let sk_vec = sk.sk.iter().map(|item| item.value()).collect_vec();
                 let network_sk_shares = NetworkValue::<LevelOne>::VecRingValue(sk_vec);
 
@@ -108,27 +111,34 @@ pub async fn transfer_secret_key<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
                 let send_sk = network_sk_shares.clone();
 
                 set.spawn(async move {
-                    let _ = networking.send(send_sk.to_network(), &identity).await;
+                    let _ = networking
+                        .send(
+                            Arc::new(send_sk.to_network()),
+                            &Role::indexed_from_zero(to_send_role),
+                        )
+                        .await;
                 });
             }
         }
         while (set.join_next().await).is_some() {}
-        let as_ntt = ks[role.zero_based()].as_ntt_repr(N65536::VALUE, N65536::THETA);
+        let as_ntt = ks[role].as_ntt_repr(N65536::VALUE, N65536::THETA);
         let ntt_shares = as_ntt
             .iter()
             .map(|ntt_val| Share::new(*role, *ntt_val))
             .collect_vec();
         Ok(PrivateBgvKeySet::from_eval_domain(ntt_shares))
     } else {
-        let receiver = session.identity_from(&Role::indexed_by_one(input_party_id))?;
         let networking = Arc::clone(session.network());
-        let timeout = session.network().get_timeout_current_round()?;
+        let timeout = session.network().get_timeout_current_round().await;
         let data = tokio::spawn(timeout_at(timeout, async move {
-            networking.receive(&receiver).await
+            networking
+                .receive(&Role::indexed_from_one(input_party_id))
+                .await
         }))
         .await??;
 
-        let sk = match NetworkValue::<LevelOne>::from_network(data)? {
+        let sk = match NetworkValue::<LevelOne>::from_network(data, deserialization_runtime).await?
+        {
             NetworkValue::<LevelOne>::VecRingValue(sk) => sk,
             _ => Err(anyhow_error_and_log(
                 "I have received sth different from a secret key!",

@@ -1,22 +1,28 @@
 use itertools::Itertools;
-use rand::{CryptoRng, Rng};
+use std::slice::IterMut;
 use tfhe::{
-    core_crypto::{commons::parameters::LweSize, entities::LweKeyswitchKeyOwned},
+    core_crypto::{
+        commons::{math::random::CompressionSeed, parameters::LweSize},
+        entities::LweKeyswitchKeyOwned,
+        prelude::SeededLweKeyswitchKeyOwned,
+    },
     shortint::{
         parameters::{DecompositionBaseLog, DecompositionLevelCount, LweDimension},
         CiphertextModulus,
     },
-};
-
-use crate::{
-    algebra::structure_traits::{BaseRing, ErrorCorrect},
-    execution::{
-        online::triple::open_list, runtime::session::BaseSessionHandles, sharing::share::Share,
-    },
+    Seed,
 };
 
 use super::lwe_ciphertext::{opened_lwe_masks_bodies_to_tfhers_u64, LweCiphertextShare};
 use crate::algebra::galois_rings::common::ResiduePoly;
+use crate::{
+    algebra::structure_traits::{BaseRing, ErrorCorrect},
+    execution::{
+        online::triple::open_list, runtime::sessions::base_session::BaseSessionHandles,
+        sharing::share::Share,
+        tfhe_internals::lwe_ciphertext::opened_lwe_bodies_to_seeded_tfhers_u64,
+    },
+};
 
 #[derive(Clone)]
 pub struct LweKeySwitchKeyShare<Z: BaseRing, const EXTENSION_DEGREE: usize> {
@@ -29,9 +35,7 @@ pub struct LweKeySwitchKeyShare<Z: BaseRing, const EXTENSION_DEGREE: usize> {
 }
 
 impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LweKeySwitchKeyShare<Z, EXTENSION_DEGREE> {
-    pub fn iter_mut_levels(
-        &mut self,
-    ) -> impl Iterator<Item = &mut Vec<LweCiphertextShare<Z, EXTENSION_DEGREE>>> {
+    pub fn iter_mut_levels(&mut self) -> IterMut<'_, Vec<LweCiphertextShare<Z, EXTENSION_DEGREE>>> {
         self.data.iter_mut()
     }
 
@@ -68,11 +72,45 @@ impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LweKeySwitchKeyShare<Z, EXTENSI
 where
     ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    pub async fn open_to_tfhers_type<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
+    pub async fn open_to_tfhers_seeded_type<S: BaseSessionHandles>(
+        self,
+        seed: u128,
+        session: &S,
+    ) -> anyhow::Result<SeededLweKeyswitchKeyOwned<u64>> {
+        let my_role = session.my_role();
+        let input_key_lwe_dimension = LweDimension(self.data.len());
+
+        let shared_bodies: Vec<_> = self
+            .data
+            .iter()
+            .flat_map(|v1| v1.iter().map(|v2| Share::new(my_role, v2.body)))
+            .collect();
+        let bodies: Vec<Z> = open_list(&shared_bodies, session)
+            .await?
+            .iter()
+            .map(|v| v.to_scalar())
+            .try_collect()?;
+
+        let mut ksk = SeededLweKeyswitchKeyOwned::new(
+            0_u64,
+            self.decomp_base_log,
+            self.decomp_level_count,
+            input_key_lwe_dimension,
+            self.output_lwe_size.to_lwe_dimension(),
+            CompressionSeed::from(Seed(seed)), // NOTE: key was generated using XOF so we need to use a custom decompression function
+            CiphertextModulus::new_native(),
+        );
+
+        let mut lwe_ciphertext_list = ksk.as_mut_seeded_lwe_ciphertext_list();
+        opened_lwe_bodies_to_seeded_tfhers_u64(bodies, &mut lwe_ciphertext_list)?;
+        Ok(ksk)
+    }
+
+    pub async fn open_to_tfhers_type<S: BaseSessionHandles>(
         self,
         session: &S,
     ) -> anyhow::Result<LweKeyswitchKeyOwned<u64>> {
-        let my_role = session.my_role()?;
+        let my_role = session.my_role();
         let input_key_lwe_dimension = LweDimension(self.data.len());
 
         let shared_bodies: Vec<_> = self

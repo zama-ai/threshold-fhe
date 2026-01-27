@@ -4,8 +4,8 @@ use crate::algebra::{
     bivariate::compute_powers_list,
     poly::Poly,
     structure_traits::{
-        BaseRing, Derive, FromU128, Invert, One, QuotientMaximalIdeal, Ring, RingEmbed, Sample,
-        Solve, Solve1, Syndrome, ZConsts, Zero,
+        BaseRing, Derive, FromU128, Invert, One, QuotientMaximalIdeal, Ring,
+        RingWithExceptionalSequence, Sample, Solve, Solve1, Syndrome, ZConsts, Zero,
     },
     syndrome::lagrange_numerators,
 };
@@ -34,7 +34,7 @@ use sha3::{
 };
 use std::marker::PhantomData;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     iter::Sum,
     ops::{Add, AddAssign, Mul, Neg, Shl, Sub, SubAssign},
@@ -51,7 +51,7 @@ use zeroize::Zeroize;
 #[derive(Clone, Copy, PartialEq, Hash, Eq, Debug, Zeroize, Versionize)]
 #[versionize(ResiduePolyVersioned)]
 pub struct ResiduePoly<Z, const EXTENSION_DEGREE: usize> {
-    pub coefs: [Z; EXTENSION_DEGREE], // TODO(Daniel) can this be a slice instead of an array?
+    pub coefs: [Z; EXTENSION_DEGREE],
 }
 
 impl<Z: Default + Copy, const EXTENSION_DEGREE: usize> Default
@@ -481,10 +481,12 @@ where
         x: &Self,
         g: u8,
         l: usize,
-        roles: &[Role],
+        roles: &HashSet<Role>,
     ) -> HashMap<Role, Vec<Self>> {
+        // Observe that since the application of SHAKE256 is highly specific and needs to be optimized here,
+        // we don't use on the wrapper in `hashing.rs`
         let mut hasher = Shake256::default();
-        hasher.update(Self::DSEP_LDS);
+        hasher.update(&Self::DSEP_LDS);
         //Update hasher with x
         for x_coef in x.coefs {
             //This line is the reason why it's not straightforward to implement Derive
@@ -529,10 +531,12 @@ where
         x: &Self,
         g: u8,
         l: usize,
-        roles: &[Role],
+        roles: &HashSet<Role>,
     ) -> HashMap<Role, Vec<Self>> {
+        // Observe that since the application of SHAKE256 is highly specific and needs to be optimized here,
+        // we don't use on the wrapper in `hashing.rs`
         let mut hasher = Shake256::default();
-        hasher.update(Self::DSEP_LDS);
+        hasher.update(&Self::DSEP_LDS);
         //Update hasher with x
         for x_coef in x.coefs {
             //This line is the reason why it's not straightforward to implement Derive
@@ -567,8 +571,12 @@ where
     const LOG_SIZE_EXCEPTIONAL_SET: usize = Self::QUOTIENT_OUTPUT_SIZE.ilog2() as usize;
 }
 
-impl<Z: Ring, const EXTENSION_DEGREE: usize> RingEmbed for ResiduePoly<Z, EXTENSION_DEGREE> {
-    fn embed_exceptional_set(idx: usize) -> anyhow::Result<Self> {
+impl<Z: Ring, const EXTENSION_DEGREE: usize> RingWithExceptionalSequence
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+{
+    fn get_from_exceptional_sequence(idx: usize) -> anyhow::Result<Self> {
         if idx >= (1 << EXTENSION_DEGREE) {
             return Err(anyhow_error_and_log(format!(
                 "Value {idx} is too large to be embedded!"
@@ -592,7 +600,7 @@ impl<Z: BaseRing, const EXTENSION_DEGREE: usize> Syndrome for ResiduePoly<Z, EXT
 where
     ResiduePoly<Z, EXTENSION_DEGREE>: QuotientMaximalIdeal,
 {
-    //NIST: Level Zero Operation (I believe this is is SynDecode + last step of correction)
+    //NIST: Level Zero Operation (SynDecode + last step of correction)
     // decode a ring syndrome into an error vector, containing the error magnitudes at the respective indices
     fn syndrome_decode(
         mut syndrome_poly: Poly<Self>,
@@ -607,14 +615,15 @@ where
         //  compute s_e^(j)/p mod p and decode
         for bit_idx in 0..ring_size {
             let sliced_syndrome_coefs: Vec<_> = syndrome_poly
-                .coefs
+                .coefs()
                 .iter()
                 .map(|c| c.bit_compose(bit_idx))
                 .collect();
 
-            let sliced_syndrome = ShamirFieldPoly::<<Self as QuotientMaximalIdeal>::QuotientOutput> {
-                coefs: sliced_syndrome_coefs,
-            };
+            let sliced_syndrome =
+                ShamirFieldPoly::<<Self as QuotientMaximalIdeal>::QuotientOutput>::from_coefs(
+                    sliced_syndrome_coefs,
+                );
 
             // bit error in this for this bit-idx
             let ej = syndrome_decoding_z2(&parties, &sliced_syndrome, threshold);
@@ -626,14 +635,15 @@ where
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
             // add the lifted e^(j) to e
-            for (e_res_e, lifted_e_e) in e_res.iter_mut().zip(lifted_e.iter()) {
+            // May panic, but would imply a bug in `syndrome_decoding_z2`
+            for (e_res_e, lifted_e_e) in e_res.iter_mut().zip_eq(lifted_e.iter()) {
                 *e_res_e += *lifted_e_e;
             }
             // correction term in the ring (inside parenthesis in syndrome update)
             let correction_shares = lifted_e
                 .iter()
                 .enumerate()
-                .map(|(idx, val)| Share::new(Role::indexed_by_zero(idx), *val))
+                .map(|(idx, val)| Share::new(Role::indexed_from_zero(idx), *val))
                 .collect_vec();
             let corrected_shamir = ShamirSharings {
                 shares: correction_shares,
@@ -649,6 +659,7 @@ where
 
     //NIST: Level Zero Operation (I believe this is is "Equation 19")
     // compute the syndrome in the GR from a given sharing and threshold
+    #[allow(clippy::needless_range_loop)]
     fn syndrome_compute(
         sharing: &ShamirSharings<Self>,
         threshold: usize,
@@ -662,14 +673,14 @@ where
         let parties: Vec<_> = sharing
             .shares
             .iter()
-            .map(|share| Self::embed_exceptional_set(share.owner().one_based()))
+            .map(|share| Self::embed_role_to_exceptional_sequence(&share.owner()))
             .collect::<Result<Vec<_>, _>>()?;
 
         // lagrange numerators from Eq.15
         let lagrange_polys = lagrange_numerators(&parties);
 
         let alpha_powers = compute_powers_list(&parties, r);
-        let mut res = Poly::zeros(r);
+        let mut res = Poly::zero();
 
         // compute syndrome coefficients
         for j in 0..r {
@@ -681,7 +692,7 @@ where
                 coef += numerator * denom.invert()?;
             }
 
-            res.coefs[j] = coef;
+            res.set_coef(j, coef);
         }
 
         Ok(res)
@@ -700,7 +711,7 @@ where
 
         let alpha_k = self.bit_compose(0);
         let ainv = alpha_k.invert();
-        let mut x0 = Self::embed_quotient_exceptional_set(ainv)?;
+        let mut x0 = Self::embed_quotient_exceptional_sequence(ainv)?;
 
         // compute Newton-Raphson iterations
         for _ in 0..Z::BIT_LENGTH.ilog2() {
@@ -722,7 +733,7 @@ where
         pos: usize,
     ) -> anyhow::Result<Poly<Self>> {
         let coefs: Vec<Self> = x
-            .coefs
+            .coefs()
             .iter()
             .map(|coef_2| Self::bit_lift(*coef_2, pos))
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -798,8 +809,11 @@ impl<const EXTENSION_DEGREE: usize> PRSSConversions for ResiduePoly<Z64, EXTENSI
         Self { coefs: poly_coefs }
     }
 
-    fn from_i128(value: i128) -> Self {
-        Self::from_scalar(Wrapping(value as u64))
+    /// Calling this means we are trying to produce
+    /// a Mask for post-SnS decryption using extesion of Z64
+    /// which is wrong
+    fn from_i128(_value: i128) -> Self {
+        panic!("Trying to call from_i128 for a Galois extension of Z64. This should only happen for extensions of Z128.")
     }
 }
 
@@ -837,11 +851,12 @@ where
     ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
 {
     let monomials = ResiduePoly::<Z, EXTENSION_DEGREE>::monomials();
-
     polys
         .chunks(EXTENSION_DEGREE)
         .map(|chunk| {
             let mut out = ResiduePoly::ZERO;
+            // Observe that if there is a difference in length between the chunk and the monomials it means the upper parts are implicitely 0
+            // thus it is fine to zip them together
             for (p, monomial) in chunk.iter().zip(monomials.iter()) {
                 out += (*p) * (*monomial);
             }

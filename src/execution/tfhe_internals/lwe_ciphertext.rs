@@ -1,27 +1,30 @@
 use itertools::{EitherOrBoth, Itertools};
-use rand::{CryptoRng, Rng};
+use rayon::prelude::*;
 use tfhe::{
     boolean::prelude::LweDimension,
     core_crypto::{
         commons::{
+            math::random::CompressionSeed,
             parameters::{LweCiphertextCount, LweSize},
-            traits::ByteRandomGenerator,
+            traits::ParallelByteRandomGenerator,
         },
         prelude::{
             CiphertextModulus, ContiguousEntityContainerMut, LweCiphertextList,
-            LweCiphertextListOwned,
+            LweCiphertextListOwned, SeededLweCiphertextList,
         },
     },
+    Seed,
 };
 
 use crate::{
     algebra::{
         galois_rings::common::ResiduePoly,
-        structure_traits::{BaseRing, ErrorCorrect, Ring},
+        structure_traits::{BaseRing, ErrorCorrect},
     },
     error::error_handler::anyhow_error_and_log,
     execution::{
-        online::triple::open_list, runtime::session::BaseSessionHandles, sharing::share::Share,
+        online::triple::open_list, runtime::sessions::base_session::BaseSessionHandles,
+        sharing::share::Share,
     },
 };
 
@@ -37,6 +40,30 @@ use super::{
 pub struct LweCiphertextShare<Z: BaseRing, const EXTENSION_DEGREE: usize> {
     pub mask: Vec<Z>,
     pub body: ResiduePoly<Z, EXTENSION_DEGREE>,
+}
+
+pub(crate) fn opened_lwe_bodies_to_seeded_tfhers_u64<Z: BaseRing>(
+    bodies: Vec<Z>,
+    output_container: &mut SeededLweCiphertextList<&mut [u64]>,
+) -> anyhow::Result<()> {
+    for (idx, body) in output_container.iter_mut().enumerate() {
+        let body_data = {
+            let tmp = bodies
+                .get(idx)
+                .ok_or_else(|| {
+                    anyhow_error_and_log(format!(
+                        "Body of incorrect size, failed trying to access idx {idx}"
+                    ))
+                })?
+                .to_byte_vec();
+            tmp.iter().rev().fold(0_u64, |acc, byte| {
+                acc.wrapping_shl(8).wrapping_add(*byte as u64)
+            })
+        };
+        *body.data = body_data;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn opened_lwe_masks_bodies_to_tfhers_u64<Z: BaseRing>(
@@ -88,8 +115,7 @@ pub(crate) fn opened_lwe_masks_bodies_to_tfhers_u64<Z: BaseRing>(
 pub(crate) async fn open_to_tfhers_type<
     Z: BaseRing,
     const EXTENSION_DEGREE: usize,
-    R: Rng + CryptoRng,
-    S: BaseSessionHandles<R>,
+    S: BaseSessionHandles,
 >(
     ciphertext_share_list: Vec<LweCiphertextShare<Z, EXTENSION_DEGREE>>,
     session: &S,
@@ -97,7 +123,7 @@ pub(crate) async fn open_to_tfhers_type<
 where
     ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    let my_role = session.my_role()?;
+    let my_role = session.my_role();
 
     // Split the body and the mask, so that we can open the body which are initially secret shared
     let (masks, shared_bodies): (Vec<Vec<Z>>, Vec<Share<ResiduePoly<Z, EXTENSION_DEGREE>>>) =
@@ -126,6 +152,51 @@ where
     Ok(output)
 }
 
+pub(crate) async fn open_to_tfhers_seeded_type<
+    Z: BaseRing,
+    const EXTENSION_DEGREE: usize,
+    S: BaseSessionHandles,
+>(
+    ciphertext_share_list: Vec<LweCiphertextShare<Z, EXTENSION_DEGREE>>,
+    seed: u128,
+    session: &S,
+) -> anyhow::Result<SeededLweCiphertextList<Vec<u64>>>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    assert!(
+        !ciphertext_share_list.is_empty(),
+        "Ciphertext share list must not be empty"
+    );
+    let lwe_dim = LweDimension(ciphertext_share_list[0].mask.len());
+    let my_role = session.my_role();
+    // Split the body from the mask, so that we can open the body which are initially secret shared
+    let shared_bodies: Vec<Share<ResiduePoly<Z, EXTENSION_DEGREE>>> = ciphertext_share_list
+        .into_iter()
+        .map(|x| Share::new(my_role, x.body))
+        .collect();
+
+    let ciphertext_count = shared_bodies.len();
+
+    // Open the body
+    let opened_bodies: Vec<Z> = open_list(&shared_bodies, session)
+        .await?
+        .into_iter()
+        .map(|x| x.to_scalar())
+        .try_collect()?;
+
+    let container = vec![0u64; ciphertext_count];
+    let mut output = SeededLweCiphertextList::from_container(
+        container,
+        lwe_dim.to_lwe_size(),
+        CompressionSeed::from(Seed(seed)), // NOTE: key was generated using XOF so we need to use a custom decompression function
+        CiphertextModulus::new_native(),
+    );
+    opened_lwe_bodies_to_seeded_tfhers_u64(opened_bodies, &mut output.as_mut_view())?;
+
+    Ok(output)
+}
+
 impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LweCiphertextShare<Z, EXTENSION_DEGREE> {
     pub fn new(lwe_size: LweSize) -> Self {
         Self {
@@ -149,11 +220,10 @@ pub fn encrypt_lwe_ciphertext<Gen, Z, const EXTENSION_DEGREE: usize>(
     output: &mut LweCiphertextShare<Z, EXTENSION_DEGREE>,
     encoded: ResiduePoly<Z, EXTENSION_DEGREE>,
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
-) -> anyhow::Result<()>
-where
-    Gen: ByteRandomGenerator,
+) where
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     let (mask, body) = output.get_mut_mask_and_body();
 
@@ -167,33 +237,37 @@ pub fn encrypt_lwe_ciphertext_list<Gen, Z, const EXTENSION_DEGREE: usize>(
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
 ) -> anyhow::Result<()>
 where
-    Gen: ByteRandomGenerator,
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    let gen_iter =
-        generator.fork_lwe_list_to_lwe(LweCiphertextCount(output.len()), output[0].lwe_size())?;
+    assert_eq!(
+        output.len(),
+        encoded.len(),
+        "Output and encoded must have the same length, got respectively {} and {}",
+        output.len(),
+        encoded.len()
+    );
 
-    for encoded_plaintext_ciphertext_loop_generator in encoded
-        .iter()
-        .zip_longest(output.iter_mut())
-        .zip_longest(gen_iter)
-    {
-        if let EitherOrBoth::Both(
-            EitherOrBoth::Both(encoded_plaintext, ciphertext),
-            mut loop_generator,
-        ) = encoded_plaintext_ciphertext_loop_generator
-        {
+    let gen_iter = generator.fork_lwe_list_to_lwe(
+        LweCiphertextCount(output.len()),
+        output[0].lwe_size(),
+        EncryptionType::Bits64,
+    )?;
+
+    encoded
+        .par_iter()
+        .zip_eq(output.par_iter_mut())
+        .zip_eq(gen_iter)
+        .for_each(|((encoded_plaintext, ciphertext), mut loop_generator)| {
             encrypt_lwe_ciphertext(
                 lwe_secret_key_share,
                 ciphertext,
                 *encoded_plaintext,
                 &mut loop_generator,
-            )?;
-        } else {
-            return Err(anyhow_error_and_log("zip error".to_string()));
-        }
-    }
+            );
+        });
+
     Ok(())
 }
 
@@ -203,11 +277,10 @@ fn fill_lwe_mask_and_body_for_encryption<Z, Gen, const EXTENSION_DEGREE: usize>(
     output_body: &mut ResiduePoly<Z, EXTENSION_DEGREE>,
     encoded: ResiduePoly<Z, EXTENSION_DEGREE>,
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
-) -> anyhow::Result<()>
-where
-    Gen: ByteRandomGenerator,
+) where
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     //Sample the mask, the only LWE encryptions we need are in the small domain
     generator.fill_slice_with_random_mask_custom_mod(output_mask, EncryptionType::Bits64);
@@ -217,11 +290,10 @@ where
 
     //Compute the multisum betweem sk and mask
     let mask_key_dot_product =
-        slice_wrapping_dot_product(output_mask, &lwe_secret_key_share.data_as_raw_vec())?;
+        slice_wrapping_dot_product(output_mask, &lwe_secret_key_share.data_as_raw_vec());
 
     //Finish computing the body
     *output_body = mask_key_dot_product + noise + encoded;
-    Ok(())
 }
 
 ///Returns a tuple (number_of_triples, number_of_bits) required for mpc lwe encryption
@@ -250,17 +322,19 @@ mod tests {
             CiphertextModulus,
         },
     };
-    use tfhe_csprng::generators::SoftwareRandomGenerator;
+    use tfhe_csprng::{generators::SoftwareRandomGenerator, seeders::XofSeed};
 
     use crate::{
         algebra::{galois_rings::degree_4::ResiduePolyF4Z64, structure_traits::Ring},
         execution::{
             online::{
-                gen_bits::{BitGenEven, RealBitGenEven},
+                gen_bits::{BitGenEven, SecureBitGenEven},
                 preprocessing::dummy::DummyPreprocessing,
                 secret_distributions::{RealSecretDistributions, SecretDistributions},
             },
-            runtime::session::{LargeSession, ParameterHandles},
+            runtime::sessions::{
+                large_session::LargeSession, session_parameters::GenericParameterHandles,
+            },
             sharing::{shamir::ShamirSharings, share::Share},
             tfhe_internals::{
                 randomness::{
@@ -281,8 +355,8 @@ mod tests {
 
     use super::{encrypt_lwe_ciphertext, LweCiphertextShare, LweSecretKeyShare};
 
-    #[test]
-    fn test_lwe_encryption() {
+    #[tokio::test]
+    async fn test_lwe_encryption() {
         //Testing with NIST params P=8
         let lwe_dimension = 1024_usize;
         let message_log_modulus = 3_usize;
@@ -294,7 +368,8 @@ mod tests {
         let num_key_bits = lwe_dimension;
 
         let mut task = |mut session: LargeSession| async move {
-            let my_role = session.my_role().unwrap();
+            let xof_seed = XofSeed::new_u128(seed, *b"TEST_GEN");
+            let my_role = session.my_role();
             let encoded_message = ShamirSharings::share(
                 &mut AesRng::seed_from_u64(0),
                 ResiduePolyF4Z64::from_scalar(Wrapping(msg << scaling)),
@@ -302,15 +377,19 @@ mod tests {
                 session.threshold() as usize,
             )
             .unwrap()
-            .shares[my_role.zero_based()]
-            .value();
+            .shares[&my_role]
+                .value();
 
-            let mut large_preproc = DummyPreprocessing::new(seed as u64, session.clone());
+            let mut large_preproc = DummyPreprocessing::new(seed as u64, &session);
 
             let lwe_secret_key_share = LweSecretKeyShare {
-                data: RealBitGenEven::gen_bits_even(num_key_bits, &mut large_preproc, &mut session)
-                    .await
-                    .unwrap(),
+                data: SecureBitGenEven::gen_bits_even(
+                    num_key_bits,
+                    &mut large_preproc,
+                    &mut session,
+                )
+                .await
+                .unwrap(),
             };
 
             let vec_tuniform_noise = RealSecretDistributions::t_uniform(
@@ -324,7 +403,7 @@ mod tests {
             .collect_vec();
 
             let mut mpc_encryption_rng = MPCEncryptionRandomGenerator {
-                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(seed),
+                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(xof_seed),
                 noise: MPCNoiseRandomGenerator {
                     vec: vec_tuniform_noise,
                 },
@@ -336,8 +415,7 @@ mod tests {
                 &mut lwe_ctxt,
                 encoded_message,
                 &mut mpc_encryption_rng,
-            )
-            .unwrap();
+            );
             (my_role, lwe_secret_key_share, lwe_ctxt)
         };
 
@@ -359,7 +437,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         //Reconstruct everything and decrypt using tfhe-rs
 
@@ -403,7 +482,7 @@ mod tests {
         let mut lwe_ctxt_mut_mask = lwe_ctxt.get_mut_mask();
         let underlying_container = lwe_ctxt_mut_mask.as_mut();
         assert_eq!(underlying_container.len(), mask_ref.len());
-        for (c, m) in underlying_container.iter_mut().zip(mask_ref) {
+        for (c, m) in underlying_container.iter_mut().zip_eq(mask_ref) {
             *c = m.0;
         }
 

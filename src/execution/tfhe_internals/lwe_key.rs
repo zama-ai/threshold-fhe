@@ -1,30 +1,38 @@
 use itertools::{EitherOrBoth, Itertools};
-use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use tfhe::{
     core_crypto::{
-        commons::traits::ByteRandomGenerator,
+        commons::{math::random::CompressionSeed, traits::ParallelByteRandomGenerator},
         entities::{LweCompactPublicKey, LweCompactPublicKeyOwned},
+        prelude::{SeededLweCompactPublicKey, SeededLweCompactPublicKeyOwned},
     },
     shortint::{
         self,
         parameters::{CompactPublicKeyEncryptionParameters, LweDimension, PolynomialSize},
         CiphertextModulus,
     },
-    Versionize,
+    Seed, Versionize,
 };
 use tfhe_versionable::VersionsDispatch;
+use tracing::instrument;
 
 use crate::{
     algebra::{
         galois_rings::common::ResiduePoly,
-        structure_traits::{BaseRing, ErrorCorrect, Ring},
+        structure_traits::{BaseRing, ErrorCorrect},
     },
     error::error_handler::anyhow_error_and_log,
     execution::{
-        online::{preprocessing::BitPreprocessing, triple::open_list},
-        runtime::session::BaseSessionHandles,
+        online::{
+            preprocessing::{BitPreprocessing, DKGPreprocessing},
+            triple::open_list,
+        },
+        runtime::sessions::base_session::BaseSessionHandles,
         sharing::share::Share,
+        tfhe_internals::{
+            parameters::{compute_min_max_hw, DKGParams, NoiseInfo},
+            utils::compute_hamming_weight_lwe_sk,
+        },
     },
 };
 
@@ -74,12 +82,12 @@ impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LweCompactPublicKeyShare<Z, EXT
 where
     ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    pub async fn open_to_tfhers_type<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
+    pub async fn open_to_tfhers_type<S: BaseSessionHandles>(
         self,
         session: &S,
     ) -> anyhow::Result<LweCompactPublicKeyOwned<u64>> {
         let lwe_dimension = LweDimension(self.glwe_ciphertext_share.polynomial_size.0);
-        let my_role = session.my_role()?;
+        let my_role = session.my_role();
         let shared_body = self
             .glwe_ciphertext_share
             .body
@@ -126,30 +134,110 @@ where
 
         Ok(pk)
     }
+
+    pub async fn open_to_tfhers_seeded_type<S: BaseSessionHandles>(
+        self,
+        seed: u128,
+        session: &S,
+    ) -> anyhow::Result<SeededLweCompactPublicKeyOwned<u64>> {
+        let lwe_dimension = LweDimension(self.glwe_ciphertext_share.polynomial_size.0);
+        let my_role = session.my_role();
+
+        let shared_body = self
+            .glwe_ciphertext_share
+            .body
+            .into_iter()
+            .map(|value| Share::new(my_role, value))
+            .collect_vec();
+        let body: Vec<Z> = open_list(&shared_body, session)
+            .await?
+            .iter()
+            .map(|value| value.to_scalar())
+            .try_collect()?;
+
+        let mut pk = SeededLweCompactPublicKeyOwned::new(
+            0_u64,
+            lwe_dimension,
+            CompressionSeed::from(Seed(seed)), // NOTE: key was generated using XOF so we need to use a custom decompression function
+            CiphertextModulus::new_native(),
+        );
+
+        let mut pk_body = pk.get_mut_body();
+
+        let underlying_container = pk_body.as_mut();
+        for c_m in underlying_container.iter_mut().zip_longest(body) {
+            if let EitherOrBoth::Both(c, m) = c_m {
+                let m_byte_vec = m.to_byte_vec();
+                let m = m_byte_vec.iter().rev().fold(0_u64, |acc, byte| {
+                    acc.wrapping_shl(8).wrapping_add(*byte as u64)
+                });
+                *c = m;
+            } else {
+                return Err(anyhow_error_and_log("zip error"));
+            }
+        }
+
+        Ok(pk)
+    }
 }
 
 pub(crate) fn to_tfhe_hl_api_compact_public_key(
     compact_lwe_pk: LweCompactPublicKey<Vec<u64>>,
     params: CompactPublicKeyEncryptionParameters,
+    tag: tfhe::Tag,
 ) -> tfhe::CompactPublicKey {
     let ipk = shortint::CompactPublicKey::from_raw_parts(compact_lwe_pk, params);
     let cpk = tfhe::integer::public_key::CompactPublicKey::from_raw_parts(ipk);
-    tfhe::CompactPublicKey::from_raw_parts(cpk, tfhe::Tag::default())
+    tfhe::CompactPublicKey::from_raw_parts(cpk, tag)
+}
+
+pub(crate) fn to_tfhe_hl_api_compressed_compact_public_key(
+    seeded_compact_lwe_pk: SeededLweCompactPublicKey<Vec<u64>>,
+    params: CompactPublicKeyEncryptionParameters,
+    tag: tfhe::Tag,
+) -> tfhe::CompressedCompactPublicKey {
+    let ipk = shortint::CompressedCompactPublicKey::from_raw_parts(seeded_compact_lwe_pk, params);
+    let cpk = tfhe::integer::public_key::CompressedCompactPublicKey::from_raw_parts(ipk);
+    tfhe::CompressedCompactPublicKey::from_raw_parts(cpk, tag)
 }
 
 impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LweSecretKeyShare<Z, EXTENSION_DEGREE>
 where
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    pub fn new_from_preprocessing<
+    pub async fn new_from_preprocessing<
         P: BitPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+        S: BaseSessionHandles,
     >(
         dimension: LweDimension,
         preprocessing: &mut P,
+        pmax: Option<f64>,
+        session: &mut S,
     ) -> anyhow::Result<Self> {
-        Ok(Self {
-            data: preprocessing.next_bit_vec(dimension.0)?,
-        })
+        let data = if let Some(pmax) = pmax {
+            let (min_hw, max_hw) = compute_min_max_hw(pmax, dimension.0 as u64);
+            let max_hw = Z::from_u128(max_hw as u128);
+            let min_hw = Z::from_u128(min_hw as u128);
+
+            let mut data;
+            loop {
+                data = preprocessing.next_bit_vec(dimension.0)?;
+                let hw = compute_hamming_weight_lwe_sk(&data, session)
+                    .await?
+                    .to_scalar()?;
+                if hw <= max_hw && hw >= min_hw {
+                    tracing::info!("Hamming weight within bounds: {hw}");
+                    break;
+                }
+                tracing::info!(
+                    "Hamming weight out of bounds: {hw}. Expected min : {min_hw}, max : {max_hw}"
+                );
+            }
+            data
+        } else {
+            preprocessing.next_bit_vec(dimension.0)?
+        };
+        Ok(Self { data })
     }
 
     pub fn lwe_dimension(&self) -> LweDimension {
@@ -159,51 +247,168 @@ where
     pub fn data_as_raw_vec(&self) -> Vec<ResiduePoly<Z, EXTENSION_DEGREE>> {
         self.data.iter().map(|share| share.value()).collect_vec()
     }
+
+    pub fn data_as_raw_iter(&self) -> impl Iterator<Item = ResiduePoly<Z, EXTENSION_DEGREE>> + '_ {
+        self.data.iter().map(|share| share.value())
+    }
 }
 
 pub fn allocate_and_generate_new_lwe_compact_public_key<Z, Gen, const EXTENSION_DEGREE: usize>(
     lwe_secret_key: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
-) -> anyhow::Result<LweCompactPublicKeyShare<Z, EXTENSION_DEGREE>>
+) -> LweCompactPublicKeyShare<Z, EXTENSION_DEGREE>
 where
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
-    Gen: ByteRandomGenerator,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+    Gen: ParallelByteRandomGenerator,
 {
     let mut pk = LweCompactPublicKeyShare::new(lwe_secret_key.lwe_dimension());
 
-    generate_lwe_compact_public_key(lwe_secret_key, &mut pk, generator)?;
+    generate_lwe_compact_public_key(lwe_secret_key, &mut pk, generator);
 
-    Ok(pk)
+    pk
 }
 
 pub fn generate_lwe_compact_public_key<Z, Gen, const EXTENSION_DEGREE: usize>(
     lwe_secret_key_share: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
     output: &mut LweCompactPublicKeyShare<Z, EXTENSION_DEGREE>,
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
-) -> anyhow::Result<()>
-where
+) where
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
-    Gen: ByteRandomGenerator,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+    Gen: ParallelByteRandomGenerator,
 {
     let encryption_type = output.glwe_ciphertext_share.encryption_type;
     let (mask, body) = output.get_mut_mask_and_body();
     generator.fill_slice_with_random_mask_custom_mod(mask, encryption_type);
 
-    slice_semi_reverse_negacyclic_convolution(body, mask, &lwe_secret_key_share.data_as_raw_vec())?;
+    slice_semi_reverse_negacyclic_convolution(body, mask, &lwe_secret_key_share.data_as_raw_vec());
 
-    generator.unsigned_torus_slice_wrapping_add_random_noise_custom_mod_assign(body)
+    generator.unsigned_torus_slice_wrapping_add_random_noise_custom_mod_assign(body);
 }
 
-///Returns a tuple (number_of_triples, number_of_randomness) required for generating a lwe key
+/// Returns a tuple (number_of_triples, number_of_randomness) required for generating a lwe key
 pub fn get_batch_param_lwe_key_gen(lwe_dimension: LweDimension) -> (usize, usize) {
     (lwe_dimension.0, lwe_dimension.0)
 }
 
+/// Generates the lwe private key share and associated public key
+async fn generate_lwe_key_shares<
+    Z: BaseRing,
+    P: DKGPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+    S: BaseSessionHandles,
+    Gen: ParallelByteRandomGenerator,
+    const EXTENSION_DEGREE: usize,
+>(
+    params: &DKGParams,
+    mpc_encryption_rng: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
+    session: &mut S,
+    preprocessing: &mut P,
+) -> anyhow::Result<(
+    LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    LweCompactPublicKeyShare<Z, EXTENSION_DEGREE>,
+)>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    let params = params.get_params_basics_handle();
+    let my_role = session.my_role();
+    //Init the shared LWE secret key
+    tracing::info!("(Party {my_role}) Generating LWE Secret key...Start");
+    let lwe_secret_key_share = LweSecretKeyShare::new_from_preprocessing(
+        params.lwe_hat_dimension(),
+        preprocessing,
+        params.get_sk_deviations().map(|d| d.pmax),
+        session,
+    )
+    .await?;
+    tracing::info!("(Party {my_role}) Generating corresponding public key...Start");
+    let NoiseInfo { amount, bound } = params.num_needed_noise_pk();
+    let vec_tuniform_noise = preprocessing
+        .next_noise_vec(amount, bound)?
+        .iter()
+        .map(|share| share.value())
+        .collect_vec();
+
+    //and fill the noise generator with noise generated above
+    mpc_encryption_rng.fill_noise(vec_tuniform_noise);
+
+    //Then actually generate the public key
+    let lwe_public_key_shared =
+        allocate_and_generate_new_lwe_compact_public_key(&lwe_secret_key_share, mpc_encryption_rng);
+
+    Ok((lwe_secret_key_share, lwe_public_key_shared))
+}
+
+/// Generates the lwe private key share and associated public key
+#[instrument(name="Gen Lwe keys",skip( mpc_encryption_rng, session, preprocessing), fields(sid = ?session.session_id(), my_role = ?session.my_role()))]
+pub(crate) async fn generate_lwe_private_public_key_pair<
+    Z: BaseRing,
+    P: DKGPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+    S: BaseSessionHandles,
+    Gen: ParallelByteRandomGenerator,
+    const EXTENSION_DEGREE: usize,
+>(
+    params: &DKGParams,
+    mpc_encryption_rng: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
+    session: &mut S,
+    preprocessing: &mut P,
+) -> anyhow::Result<(
+    LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    LweCompactPublicKey<Vec<u64>>,
+)>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    let (lwe_secret_key_share, lwe_public_key_shared) =
+        generate_lwe_key_shares(params, mpc_encryption_rng, session, preprocessing).await?;
+
+    //Open the public key and cast it to TFHE-RS type
+    Ok((
+        lwe_secret_key_share,
+        lwe_public_key_shared.open_to_tfhers_type(session).await?,
+    ))
+}
+
+/// Generates the lwe private key share and associated public key
+#[instrument(name="Gen compressed Lwe keys",skip( mpc_encryption_rng, session, preprocessing), fields(sid = ?session.session_id(), my_role = ?session.my_role()))]
+pub(crate) async fn generate_lwe_private_compressed_public_key_pair<
+    Z: BaseRing,
+    P: DKGPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+    S: BaseSessionHandles,
+    Gen: ParallelByteRandomGenerator,
+    const EXTENSION_DEGREE: usize,
+>(
+    params: &DKGParams,
+    mpc_encryption_rng: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
+    session: &mut S,
+    preprocessing: &mut P,
+    seed: u128,
+) -> anyhow::Result<(
+    LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    SeededLweCompactPublicKey<Vec<u64>>,
+)>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    let (lwe_secret_key_share, lwe_public_key_shared) =
+        generate_lwe_key_shares(params, mpc_encryption_rng, session, preprocessing).await?;
+
+    //Open the public key and cast it to TFHE-RS type
+    Ok((
+        lwe_secret_key_share,
+        lwe_public_key_shared
+            .open_to_tfhers_seeded_type(seed, session)
+            .await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    use aes_prng::AesRng;
     use itertools::Itertools;
+    use num_integer::Integer;
+    use rand::SeedableRng;
     use std::collections::HashMap;
     use tfhe::{
         core_crypto::{
@@ -212,7 +417,7 @@ mod tests {
                 misc::divide_round,
             },
             commons::{
-                generators::{EncryptionRandomGenerator, SecretRandomGenerator},
+                generators::EncryptionRandomGenerator,
                 math::random::{DefaultRandomGenerator, RandomGenerator, TUniform},
             },
             entities::{LweCiphertext, LweSecretKeyOwned, Plaintext},
@@ -230,15 +435,19 @@ mod tests {
     use crate::execution::tfhe_internals::lwe_key::to_tfhe_hl_api_compact_public_key;
     use crate::{
         algebra::{
-            base_ring::Z64, galois_rings::degree_4::ResiduePolyF4Z64, structure_traits::Ring,
+            base_ring::Z64,
+            galois_rings::degree_4::ResiduePolyF4Z64,
+            structure_traits::{One, Ring, Zero},
         },
         execution::{
             online::{
-                gen_bits::{BitGenEven, RealBitGenEven},
-                preprocessing::dummy::DummyPreprocessing,
+                gen_bits::{BitGenEven, SecureBitGenEven},
+                preprocessing::{dummy::DummyPreprocessing, memory::InMemoryBitPreprocessing},
                 secret_distributions::{RealSecretDistributions, SecretDistributions},
             },
-            runtime::session::{LargeSession, ParameterHandles},
+            runtime::sessions::{
+                large_session::LargeSession, session_parameters::GenericParameterHandles,
+            },
             tfhe_internals::{
                 parameters::TUniformBound,
                 randomness::{
@@ -253,8 +462,8 @@ mod tests {
 
     use super::{allocate_and_generate_new_lwe_compact_public_key, LweSecretKeyShare};
 
-    #[test]
-    fn test_pk_generation() {
+    #[tokio::test]
+    async fn test_pk_generation() {
         let lwe_dimension = 1024_usize;
         let message_log_modulus = 3_usize;
         let ctxt_log_modulus = 64_usize;
@@ -263,14 +472,14 @@ mod tests {
         let num_key_bits = lwe_dimension;
 
         let mut task = |mut session: LargeSession| async move {
-            let my_role = session.my_role().unwrap();
+            let my_role = session.my_role();
 
             let seed = 0;
 
-            let mut large_preproc = DummyPreprocessing::new(seed as u64, session.clone());
+            let mut large_preproc = DummyPreprocessing::new(seed as u64, &session);
 
             let vec_shared_bits =
-                RealBitGenEven::gen_bits_even(num_key_bits, &mut large_preproc, &mut session)
+                SecureBitGenEven::gen_bits_even(num_key_bits, &mut large_preproc, &mut session)
                     .await
                     .unwrap();
 
@@ -304,8 +513,7 @@ mod tests {
             let pk = allocate_and_generate_new_lwe_compact_public_key(
                 &lwe_secret_key_share,
                 &mut mpc_encryption_rng,
-            )
-            .unwrap();
+            );
 
             let opened_pk = pk.clone().open_to_tfhers_type(&session).await.unwrap();
 
@@ -330,7 +538,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         let mut lwe_key_shares = HashMap::new();
         let opened_pk_ref = results[0].2.clone();
@@ -363,8 +572,6 @@ mod tests {
         let mut seeder = new_seeder();
         let mut encryption_random_generator: EncryptionRandomGenerator<DefaultRandomGenerator> =
             EncryptionRandomGenerator::new(seeder.seed(), seeder.as_mut());
-        let mut secret_random_generator: SecretRandomGenerator<DefaultRandomGenerator> =
-            SecretRandomGenerator::new(seeder.seed());
 
         let noise_distrib =
             DynamicDistribution::TUniform(TUniform::new(t_uniform_bound.try_into().unwrap()));
@@ -374,8 +581,7 @@ mod tests {
             plaintext,
             noise_distrib,
             noise_distrib,
-            &mut secret_random_generator,
-            &mut encryption_random_generator,
+            encryption_random_generator.noise_generator_mut(),
         );
         //Decrypt using secret key
         let decrypted = decrypt_lwe_ciphertext(&lwe_secret_key, &ct);
@@ -396,10 +602,107 @@ mod tests {
         let raw_pk = pk.clone().into_raw_parts().0.into_raw_parts();
         let (lcpk, params) = raw_pk.into_raw_parts();
 
-        let hl_client_key = to_tfhe_hl_api_compact_public_key(lcpk, params);
+        let hl_client_key = to_tfhe_hl_api_compact_public_key(lcpk, params, tfhe::Tag::default());
         assert_eq!(hl_client_key.into_raw_parts(), pk.clone().into_raw_parts());
         let ct: FheUint8 = expanded_encrypt(&pk, 42_u8, 8).unwrap();
         let msg: u8 = ct.decrypt(&client_key);
         assert_eq!(42, msg);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_forced_hw_keygen_lwe() {
+        // Params such that we need a key with HW between 4 and 6
+        let pmax = 0.6;
+        let key_size = 10;
+
+        let mut task = |mut session: LargeSession| async move {
+            let my_role = session.my_role();
+            let mut rng = AesRng::seed_from_u64(42);
+
+            let my_share_of_zero = DummyPreprocessing::share(
+                session.num_parties(),
+                session.threshold(),
+                ResiduePolyF4Z64::ZERO,
+                &mut rng,
+            )
+            .unwrap()[&my_role];
+
+            let my_share_of_one = DummyPreprocessing::share(
+                session.num_parties(),
+                session.threshold(),
+                ResiduePolyF4Z64::ONE,
+                &mut rng,
+            )
+            .unwrap()[&my_role];
+
+            // Create a vector of shares of zero and one to be used in preprocessing
+            let available_bits = (0..2 * key_size)
+                .map(|i| {
+                    // Vector with a first chunk of  HW = 2
+                    // and a second chunk of HW = 5
+                    if i < key_size {
+                        if i % (key_size / 2) == 0 {
+                            my_share_of_one
+                        } else {
+                            my_share_of_zero
+                        }
+                    } else if i.is_even() {
+                        my_share_of_one
+                    } else {
+                        my_share_of_zero
+                    }
+                })
+                .collect_vec();
+
+            let mut preprocessing = InMemoryBitPreprocessing { available_bits };
+
+            let lwe_key = LweSecretKeyShare::new_from_preprocessing(
+                LweDimension(key_size),
+                &mut preprocessing,
+                Some(pmax),
+                &mut session,
+            )
+            .await
+            .unwrap();
+            (my_role, lwe_key)
+        };
+
+        let parties = 5;
+        let threshold = 1;
+        let results = execute_protocol_large::<
+            _,
+            _,
+            ResiduePolyF4Z64,
+            { ResiduePolyF4Z64::EXTENSION_DEGREE },
+        >(
+            parties,
+            threshold,
+            None,
+            NetworkMode::Async,
+            None,
+            &mut task,
+        )
+        .await;
+
+        let mut lwe_key_shares = HashMap::new();
+        for (role, key_shares) in results {
+            lwe_key_shares.insert(role, Vec::new());
+            let lwe_key_shares = lwe_key_shares.get_mut(&role).unwrap();
+            for key_share in key_shares.data {
+                (*lwe_key_shares).push(key_share);
+            }
+        }
+        //Try and reconstruct the key
+        let key = reconstruct_bit_vec(lwe_key_shares, key_size, threshold);
+
+        // Assert correct HW of the key
+        let hw = key.iter().filter(|b| **b == 1).count();
+        assert_eq!(hw, 5);
+
+        //Assert tracing contains "Hamming weight out of bounds"
+        assert!(logs_contain(
+            "Hamming weight out of bounds: 2. Expected min : 4, max : 6"
+        ));
     }
 }

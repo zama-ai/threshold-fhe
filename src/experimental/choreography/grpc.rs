@@ -1,4 +1,6 @@
 //! gRPC-based choreography for experimental features
+//! It is not really an issue to have "unsafe" code here (e.g. unsafe deserialization)
+//! as this is meant for testing and benchmarking, and definitely not for production use.
 
 use crate::choreography::grpc::gen::choreography_server::{Choreography, ChoreographyServer};
 
@@ -10,20 +12,22 @@ use crate::choreography::grpc::gen::{
     ThresholdDecryptResultResponse, ThresholdKeyGenRequest, ThresholdKeyGenResponse,
     ThresholdKeyGenResultRequest, ThresholdKeyGenResultResponse,
 };
+use crate::choreography::grpc::r#gen::{ReshareRequest, ReshareResponse};
 use crate::choreography::grpc::{
     create_small_sessions, fill_network_memory_info_multiple_sessions,
     fill_network_memory_info_single_session, gen_random_sid,
 };
 use crate::choreography::requests::Status;
-use crate::execution::large_execution::vss::RealVss;
 use crate::execution::online::preprocessing::dummy::DummyPreprocessing;
 use crate::execution::online::preprocessing::PreprocessorFactory;
-use crate::execution::runtime::party::{Identity, Role};
-use crate::execution::runtime::session::ParameterHandles;
-use crate::execution::runtime::session::SessionParameters;
-use crate::execution::runtime::session::SmallSession;
-use crate::execution::runtime::session::{BaseSession, BaseSessionStruct};
-use crate::execution::small_execution::prss::PRSSSetup;
+use crate::execution::runtime::party::{Identity, Role, RoleAssignment};
+use crate::execution::runtime::sessions::base_session::BaseSession;
+use crate::execution::runtime::sessions::session_parameters::GenericParameterHandles;
+use crate::execution::runtime::sessions::session_parameters::SessionParameters;
+use crate::execution::runtime::sessions::small_session::SmallSession;
+use crate::execution::small_execution::prss::{
+    DerivePRSSState, PRSSInit, PRSSSetup, RobustSecurePrssInit,
+};
 use crate::experimental::algebra::levels::{LevelEll, LevelKsw, LevelOne};
 use crate::experimental::algebra::ntt::{Const, N65536};
 use crate::experimental::bgv::basics::{PrivateBgvKeySet, PublicBgvKeySet, PublicKey};
@@ -37,19 +41,23 @@ use crate::experimental::choreography::requests::{PreprocKeyGenParams, Threshold
 use crate::experimental::constants::INPUT_PARTY_ID;
 use crate::experimental::constants::PLAINTEXT_MODULUS;
 use crate::networking::constants::MAX_EN_DECODE_MESSAGE_SIZE;
-use crate::networking::NetworkMode;
-use crate::networking::NetworkingStrategy;
+use crate::networking::{grpc::GrpcNetworkingManager, NetworkMode};
 use crate::session_id::SessionId;
 use aes_prng::AesRng;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use futures::TryFutureExt;
 use itertools::Itertools;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::Wrapping;
 use std::sync::Arc;
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::Duration;
+use tokio::{
+    sync::RwLock,
+    task::{JoinHandle, JoinSet},
+    time::Duration,
+};
 use tracing::{instrument, Instrument};
 
 use super::requests::{
@@ -63,22 +71,37 @@ enum SupportedPRSSSetup {
 }
 
 impl SupportedPRSSSetup {
+    // This method returns Result<T, tonic::Status> directly rather than using our BoxedStatus wrapper.
+    // This is a deliberate design choice for the following reasons:
+    // 1. This is a gRPC service method that directly propagates errors to the transport layer
+    // 2. Performance optimization - avoiding unnecessary boxing/unboxing of errors
+    // 3. Simplicity - maintaining direct compatibility with the tonic gRPC interface
+    // The clippy::result_large_err warning is suppressed because this is an API boundary
+    // where the error type is dictated by the external interface requirements.
+    #[allow(clippy::result_large_err)]
     fn get_levelone(&self) -> Result<PRSSSetup<LevelOne>, tonic::Status> {
         match self {
             SupportedPRSSSetup::LevelOne(res) => Ok(res.clone()),
             _ => Err(tonic::Status::new(
                 tonic::Code::Aborted,
-                "Can not retrieve PRSS init for poly64, make sure you init it first",
+                "Can not retrieve PRSS init for LevelOne, make sure you init it first",
             )),
         }
     }
-
+    // This method returns Result<T, tonic::Status> directly rather than using our BoxedStatus wrapper.
+    // This is a deliberate design choice for the following reasons:
+    // 1. This is a gRPC service method that directly propagates errors to the transport layer
+    // 2. Performance optimization - avoiding unnecessary boxing/unboxing of errors
+    // 3. Simplicity - maintaining direct compatibility with the tonic gRPC interface
+    // The clippy::result_large_err warning is suppressed because this is an API boundary
+    // where the error type is dictated by the external interface requirements.
+    #[allow(clippy::result_large_err)]
     fn get_levelksw(&self) -> Result<PRSSSetup<LevelKsw>, tonic::Status> {
         match self {
             SupportedPRSSSetup::LevelKsw(res) => Ok(res.clone()),
             _ => Err(tonic::Status::new(
                 tonic::Code::Aborted,
-                "Can not retrieve PRSS init for poly128, make sure you init it first",
+                "Can not retrieve PRSS init for LevelKsw, make sure you init it first",
             )),
         }
     }
@@ -106,25 +129,25 @@ struct GrpcDataStores {
 }
 
 pub struct ExperimentalGrpcChoreography {
-    own_identity: Identity,
-    networking_strategy: NetworkingStrategy,
+    my_role: Role,
+    networking_manager: Arc<GrpcNetworkingManager>,
     data: GrpcDataStores,
 }
 
 impl ExperimentalGrpcChoreography {
     pub fn new<const EXTENSION_DEGREE: usize>(
-        own_identity: Identity,
-        networking_strategy: NetworkingStrategy,
+        my_role: Role,
+        networking_manager: Arc<GrpcNetworkingManager>,
         //NOTE: Might need the factory when/if we implemented orchestrator with redis for
         //dkg preproc (but we may also decide to always use InMemory preprocessing?)
         //Also, have to put a dummy degree here that's implemented for trait bounds reasons
         //even though it's not used in BGV/BFV implem
         _factory: Box<dyn PreprocessorFactory<EXTENSION_DEGREE>>,
     ) -> Self {
-        tracing::debug!("Starting Party with identity: {own_identity}");
+        tracing::debug!("Starting Party with role: {my_role}");
         ExperimentalGrpcChoreography {
-            own_identity,
-            networking_strategy,
+            my_role,
+            networking_manager,
             data: GrpcDataStores::default(),
         }
     }
@@ -139,16 +162,17 @@ impl ExperimentalGrpcChoreography {
         &self,
         request_sid: SessionId,
         threshold: u8,
-        role_assignments: HashMap<Role, Identity>,
+        // TODO does not need to be Arc
+        role_assignment: Arc<RwLock<RoleAssignment<Role>>>,
         network_mode: NetworkMode,
         seed: Option<u64>,
-    ) -> anyhow::Result<BaseSessionStruct<AesRng, SessionParameters>> {
+    ) -> anyhow::Result<BaseSession> {
         Ok(self
             .create_base_sessions(
                 request_sid,
                 1,
                 threshold,
-                role_assignments,
+                role_assignment,
                 network_mode,
                 seed,
             )
@@ -158,60 +182,66 @@ impl ExperimentalGrpcChoreography {
                 || {
                     Err(tonic::Status::new(
                         tonic::Code::Aborted,
-                        format!("Failed to create session for {:?}", request_sid),
+                        format!("Failed to create session for {request_sid:?}"),
                     ))
                 },
                 Ok,
             )?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_base_sessions(
         &self,
         request_sid: SessionId,
         num_sessions: usize,
         threshold: u8,
-        role_assignments: HashMap<Role, Identity>,
+        role_assignment: Arc<RwLock<RoleAssignment<Role>>>,
         network_mode: NetworkMode,
         seed: Option<u64>,
-    ) -> anyhow::Result<Vec<BaseSessionStruct<AesRng, SessionParameters>>> {
-        let mut session_id_generator = AesRng::from_seed(request_sid.0.to_be_bytes());
+    ) -> anyhow::Result<Vec<BaseSession>> {
+        let sid_u128 = request_sid.into();
+        let mut session_id_generator = AesRng::from_seed(request_sid.to_le_bytes());
         let sids = (0..num_sessions)
-            .map(|_| gen_random_sid(&mut session_id_generator, request_sid.0))
+            .map(|_| gen_random_sid(&mut session_id_generator, sid_u128))
             .collect_vec();
 
-        //Fetch my Role for the role_assignment
-        let mut my_role_idx = 0;
-        for (role, identity) in role_assignments.iter() {
-            if *identity == self.own_identity {
-                my_role_idx = role.one_based() as u64;
-            }
-        }
+        let roles = role_assignment
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+
         let mut base_sessions = Vec::new();
         for (idx, session_id) in sids.into_iter().enumerate() {
-            let params = SessionParameters::new(
-                threshold,
-                session_id,
-                self.own_identity.clone(),
-                role_assignments.clone(),
-            )
-            .unwrap();
             //We are executing offline phase, so requires Sync network
-            let networking =
-                (self.networking_strategy)(session_id, role_assignments.clone(), network_mode)
-                    .await
-                    .map_err(|e| {
-                        tonic::Status::new(
-                            tonic::Code::Aborted,
-                            format!("Failed to create networking: {:?}", e),
-                        )
-                    })?;
+            let networking = self
+                .networking_manager
+                .make_network_session(
+                    session_id,
+                    &*role_assignment.read().await,
+                    self.my_role,
+                    network_mode,
+                )
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Aborted,
+                        format!("Failed to create networking: {e:?}"),
+                    )
+                })?;
+            let params =
+                SessionParameters::new(threshold, session_id, self.my_role, roles.clone()).unwrap();
             let aes_rng = if let Some(seed) = seed {
-                AesRng::seed_from_u64(seed + my_role_idx + (idx as u64))
+                let mut computed_seed = Wrapping(seed);
+                computed_seed += Wrapping((self.my_role.one_based() * num_sessions) as u64);
+                computed_seed += Wrapping(idx as u64);
+                AesRng::seed_from_u64(computed_seed.0)
             } else {
                 AesRng::from_entropy()
             };
             base_sessions.push(
-                BaseSessionStruct::new(params.clone(), networking, aes_rng)
+                BaseSession::new(params.clone(), networking, aes_rng)
                     .expect("Failed to create Base Session"),
             );
         }
@@ -240,20 +270,22 @@ impl Choreography for ExperimentalGrpcChoreography {
             )
         })?;
 
-        let role_assignments: HashMap<Role, Identity> =
-            bincode::deserialize(&request.role_assignment).map_err(|e| {
+        let role_assignment: HashMap<Role, Identity> =
+            bc2wrap::deserialize_safe(&request.role_assignment).map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse role assignment: {:?}", e),
+                    format!("Failed to parse role assignment: {e:?}"),
                 )
             })?;
+        let role_assignment = Arc::new(RwLock::new(RoleAssignment::from(role_assignment)));
 
-        let prss_params: PrssInitParams = bincode::deserialize(&request.params).map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Aborted,
-                format!("Failed to parse prss params: {:?}", e),
-            )
-        })?;
+        let prss_params: PrssInitParams =
+            bc2wrap::deserialize_safe(&request.params).map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Aborted,
+                    format!("Failed to parse prss params: {e:?}"),
+                )
+            })?;
 
         let session_id = prss_params.session_id;
         let ring = prss_params.ring;
@@ -262,7 +294,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             .create_base_session(
                 session_id,
                 threshold,
-                role_assignments.clone(),
+                role_assignment.clone(),
                 NetworkMode::Sync,
                 request.seed,
             )
@@ -270,7 +302,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             .map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to create Base Session: {:?}", e),
+                    format!("Failed to create Base Session: {e:?}"),
                 )
             })?;
 
@@ -278,16 +310,16 @@ impl Choreography for ExperimentalGrpcChoreography {
         match ring {
             SupportedRing::LevelOne => {
                 let my_future = || async move {
-                    let prss_setup =
-                        PRSSSetup::<LevelOne>::robust_init(&mut base_session, &RealVss::default())
-                            .await
-                            .unwrap();
+                    let prss_setup = RobustSecurePrssInit::default()
+                        .init(&mut base_session)
+                        .await
+                        .unwrap();
                     store.insert(
                         SupportedRing::LevelOne,
                         SupportedPRSSSetup::LevelOne(prss_setup),
                     );
                     tracing::info!("PRSS Setup for LevelOne Done.");
-                    fill_network_memory_info_single_session(base_session);
+                    fill_network_memory_info_single_session(base_session).await;
                 };
                 self.data.status_store.insert(
                     session_id,
@@ -296,16 +328,16 @@ impl Choreography for ExperimentalGrpcChoreography {
             }
             SupportedRing::LevelKsw => {
                 let my_future = || async move {
-                    let prss_setup =
-                        PRSSSetup::<LevelKsw>::robust_init(&mut base_session, &RealVss::default())
-                            .await
-                            .unwrap();
+                    let prss_setup = RobustSecurePrssInit::default()
+                        .init(&mut base_session)
+                        .await
+                        .unwrap();
                     store.insert(
                         SupportedRing::LevelKsw,
                         SupportedPRSSSetup::LevelKsw(prss_setup),
                     );
                     tracing::info!("PRSS Setup for LevelKsw Done.");
-                    fill_network_memory_info_single_session(base_session);
+                    fill_network_memory_info_single_session(base_session).await;
                 };
                 self.data.status_store.insert(
                     session_id,
@@ -335,19 +367,20 @@ impl Choreography for ExperimentalGrpcChoreography {
             )
         })?;
 
-        let role_assignments: HashMap<Role, Identity> =
-            bincode::deserialize(&request.role_assignment).map_err(|e| {
+        let role_assignment: HashMap<Role, Identity> =
+            bc2wrap::deserialize_safe(&request.role_assignment).map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse role assignment: {:?}", e),
+                    format!("Failed to parse role assignment: {e:?}"),
                 )
             })?;
+        let role_assignment = Arc::new(RwLock::new(RoleAssignment::from(role_assignment)));
 
-        let preproc_params: PreprocKeyGenParams =
-            bincode::deserialize(&request.params).map_err(|e| {
+        let preproc_params: PreprocKeyGenParams = bc2wrap::deserialize_safe(&request.params)
+            .map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse Preproc KeyGen params: {:?}", e),
+                    format!("Failed to parse Preproc KeyGen params: {e:?}"),
                 )
             })?;
 
@@ -360,7 +393,7 @@ impl Choreography for ExperimentalGrpcChoreography {
                 start_sid,
                 num_sessions as usize,
                 threshold,
-                role_assignments.clone(),
+                role_assignment.clone(),
                 NetworkMode::Sync,
                 request.seed,
             )
@@ -368,7 +401,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             .map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to create Base Session: {:?}", e),
+                    format!("Failed to create Base Session: {e:?}"),
                 )
             })?;
 
@@ -388,6 +421,11 @@ impl Choreography for ExperimentalGrpcChoreography {
         let my_future = || async move {
             let small_sessions = create_small_sessions(base_sessions, &prss_setup);
 
+            let small_sessions = small_sessions
+                .into_iter()
+                .map(|s| s.to_secure_small_session())
+                .collect();
+
             let orchestrator = BGVPreprocessingOrchestrator::new(N65536::VALUE);
 
             let (sessions, preproc) = orchestrator
@@ -395,7 +433,7 @@ impl Choreography for ExperimentalGrpcChoreography {
                 .instrument(tracing::info_span!("orchestrate"))
                 .await
                 .unwrap();
-            fill_network_memory_info_multiple_sessions(sessions);
+            fill_network_memory_info_multiple_sessions(sessions).await;
             store.insert(start_sid, preproc);
         };
         self.data.status_store.insert(
@@ -403,7 +441,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             tokio::spawn(my_future().instrument(tracing::Span::current())),
         );
 
-        let sid_serialized = bincode::serialize(&session_id).map_err(|e| {
+        let sid_serialized = bc2wrap::serialize(&session_id).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error serializing session ID {e}"),
@@ -432,19 +470,20 @@ impl Choreography for ExperimentalGrpcChoreography {
             )
         })?;
 
-        let role_assignments: HashMap<Role, Identity> =
-            bincode::deserialize(&request.role_assignment).map_err(|e| {
+        let role_assignment: HashMap<Role, Identity> =
+            bc2wrap::deserialize_safe(&request.role_assignment).map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse role assignment: {:?}", e),
+                    format!("Failed to parse role assignment: {e:?}"),
                 )
             })?;
+        let role_assignment = Arc::new(RwLock::new(RoleAssignment::from(role_assignment)));
 
         let kg_params: ThresholdKeyGenParams =
-            bincode::deserialize(&request.params).map_err(|e| {
+            bc2wrap::deserialize_safe(&request.params).map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse Threshold KeyGen params: {:?}", e),
+                    format!("Failed to parse Threshold KeyGen params: {e:?}"),
                 )
             })?;
 
@@ -455,7 +494,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             .create_base_session(
                 session_id,
                 threshold,
-                role_assignments.clone(),
+                role_assignment.clone(),
                 NetworkMode::Async,
                 request.seed,
             )
@@ -463,7 +502,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             .map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to create Base Session: {:?}", e),
+                    format!("Failed to create Base Session: {e:?}"),
                 )
             })?;
 
@@ -476,7 +515,7 @@ impl Choreography for ExperimentalGrpcChoreography {
                 )
             })?;
             let my_future = || async move {
-                let keys = bgv_distributed_keygen::<N65536, _, _, _>(
+                let keys = bgv_distributed_keygen::<N65536, _, _>(
                     &mut base_session,
                     &mut preproc,
                     PLAINTEXT_MODULUS.get().0,
@@ -484,7 +523,7 @@ impl Choreography for ExperimentalGrpcChoreography {
                 .await
                 .unwrap();
                 key_store.insert(session_id, Arc::new(keys));
-                fill_network_memory_info_single_session(base_session);
+                fill_network_memory_info_single_session(base_session).await;
             };
             self.data.status_store.insert(
                 session_id,
@@ -506,12 +545,10 @@ impl Choreography for ExperimentalGrpcChoreography {
 
             let mut small_session =
                 SmallSession::new_from_prss_state(base_session, prss_state).unwrap();
-            let mut preproc = DummyPreprocessing::<LevelKsw, _, _>::new(
-                session_id.0 as u64,
-                small_session.clone(),
-            );
+            let sid_u128: u128 = session_id.into();
+            let mut preproc = DummyPreprocessing::<LevelKsw>::new(sid_u128 as u64, &small_session);
             let my_future = || async move {
-                let keys = bgv_distributed_keygen::<N65536, _, _, _>(
+                let keys = bgv_distributed_keygen::<N65536, _, _>(
                     &mut small_session,
                     &mut preproc,
                     PLAINTEXT_MODULUS.get().0,
@@ -519,7 +556,7 @@ impl Choreography for ExperimentalGrpcChoreography {
                 .await
                 .unwrap();
                 key_store.insert(session_id, Arc::new(keys));
-                fill_network_memory_info_single_session(small_session);
+                fill_network_memory_info_single_session(small_session).await;
             };
             self.data.status_store.insert(
                 session_id,
@@ -527,7 +564,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             );
         }
 
-        let sid_serialized = bincode::serialize(&session_id).map_err(|e| {
+        let sid_serialized = bc2wrap::serialize(&session_id).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error serializing session ID {e}"),
@@ -545,74 +582,75 @@ impl Choreography for ExperimentalGrpcChoreography {
     ) -> Result<tonic::Response<ThresholdKeyGenResultResponse>, tonic::Status> {
         let request = request.into_inner();
 
-        let kg_result_params: ThresholdKeyGenResultParams = bincode::deserialize(&request.params)
-            .map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Aborted,
-                format!("Failed to parse Threshold KeyGen Result params: {:?}", e),
-            )
-        })?;
+        let kg_result_params: ThresholdKeyGenResultParams =
+            bc2wrap::deserialize_safe(&request.params).map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Aborted,
+                    format!("Failed to parse Threshold KeyGen Result params: {e:?}"),
+                )
+            })?;
 
         let session_id = kg_result_params.session_id;
         let gen_params = kg_result_params.gen_params;
 
         if gen_params {
-            let role_assignments: HashMap<Role, Identity> =
-                bincode::deserialize(&request.role_assignment).map_err(|e| {
+            let role_assignment: HashMap<Role, Identity> =
+                bc2wrap::deserialize_safe(&request.role_assignment).map_err(|e| {
                     tonic::Status::new(
                         tonic::Code::Aborted,
-                        format!("Failed to parse role assignment: {:?}", e),
+                        format!("Failed to parse role assignment: {e:?}"),
                     )
                 })?;
-            let params = SessionParameters::new(
-                0,
-                session_id,
-                self.own_identity.clone(),
-                role_assignments.clone(),
-            )
-            .map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Aborted,
-                    format!("Failed to create a base session parameters: {:?}", e),
-                )
-            })?;
+            let roles = role_assignment.keys().cloned().collect();
 
-            let networking =
-                (self.networking_strategy)(session_id, role_assignments, NetworkMode::Async)
-                    .await
-                    .map_err(|e| {
-                        tonic::Status::new(
-                            tonic::Code::Aborted,
-                            format!("Failed to create networking: {:?}", e),
-                        )
-                    })?;
+            let networking = self
+                .networking_manager
+                .make_network_session(
+                    session_id,
+                    &RoleAssignment::from(role_assignment),
+                    self.my_role,
+                    NetworkMode::Async,
+                )
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Aborted,
+                        format!("Failed to create networking: {e:?}"),
+                    )
+                })
+                .await?;
+
+            let params =
+                SessionParameters::new(0, session_id, self.my_role, roles).map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Aborted,
+                        format!("Failed to create a base session parameters: {e:?}"),
+                    )
+                })?;
 
             //NOTE: Do we want to let the user specify a Rng seed for reproducibility ?
-            let mut base_session =
-                BaseSessionStruct::new(params, networking, AesRng::from_entropy()).map_err(
-                    |e| {
-                        tonic::Status::new(
-                            tonic::Code::Aborted,
-                            format!("Failed to create Base Session: {:?}", e),
-                        )
-                    },
-                )?;
+            let mut base_session = BaseSession::new(params, networking, AesRng::from_entropy())
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Aborted,
+                        format!("Failed to create Base Session: {e:?}"),
+                    )
+                })?;
             let keys = local_initialize_key_material(&mut base_session)
                 .await
                 .map_err(|e| {
                     tonic::Status::new(
                         tonic::Code::Aborted,
-                        format!("Failed to do centralised key generation {:?}", e),
+                        format!("Failed to do centralised key generation {e:?}"),
                     )
                 })?;
             self.data
                 .key_store
                 .insert(session_id, Arc::new(keys.clone()));
             return Ok(tonic::Response::new(ThresholdKeyGenResultResponse {
-                pub_keyset: bincode::serialize(&keys.0).map_err(|e| {
+                pub_keyset: bc2wrap::serialize(&keys.0).map_err(|e| {
                     tonic::Status::new(
                         tonic::Code::Aborted,
-                        format!("Failed to serialize pubkey: {:?}", e),
+                        format!("Failed to serialize pubkey: {e:?}"),
                     )
                 })?,
             }));
@@ -620,10 +658,10 @@ impl Choreography for ExperimentalGrpcChoreography {
             let keys = self.data.key_store.get(&session_id);
             if let Some(keys) = keys {
                 return Ok(tonic::Response::new(ThresholdKeyGenResultResponse {
-                    pub_keyset: bincode::serialize(&keys.0).map_err(|e| {
+                    pub_keyset: bc2wrap::serialize(&keys.0).map_err(|e| {
                         tonic::Status::new(
                             tonic::Code::Aborted,
-                            format!("Failed to serialize pubkey: {:?}", e),
+                            format!("Failed to serialize pubkey: {e:?}"),
                         )
                     })?,
                 }));
@@ -661,19 +699,20 @@ impl Choreography for ExperimentalGrpcChoreography {
             )
         })?;
 
-        let role_assignments: HashMap<Role, Identity> =
-            bincode::deserialize(&request.role_assignment).map_err(|e| {
+        let role_assignment: HashMap<Role, Identity> =
+            bc2wrap::deserialize_safe(&request.role_assignment).map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse role assignment: {:?}", e),
+                    format!("Failed to parse role assignment: {e:?}"),
                 )
             })?;
+        let role_assignment = Arc::new(RwLock::new(RoleAssignment::from(role_assignment)));
 
-        let preproc_params: ThresholdDecryptParams = bincode::deserialize(&request.params)
+        let preproc_params: ThresholdDecryptParams = bc2wrap::deserialize_safe(&request.params)
             .map_err(|e| {
                 tonic::Status::new(
                     tonic::Code::Aborted,
-                    format!("Failed to parse preproc params: {:?}", e),
+                    format!("Failed to parse preproc params: {e:?}"),
                 )
             })?;
 
@@ -718,7 +757,7 @@ impl Choreography for ExperimentalGrpcChoreography {
                 session_id,
                 num_parallel,
                 threshold,
-                role_assignments.clone(),
+                role_assignment.clone(),
                 NetworkMode::Async,
                 request.seed,
             )
@@ -727,15 +766,25 @@ impl Choreography for ExperimentalGrpcChoreography {
         let mut small_sessions = create_small_sessions(base_sessions, &prss_setup);
 
         //Sort here, because we sort the result by sid to make sure all parties output same thing
-        small_sessions.sort_by_key(|s| s.session_id().0);
+        small_sessions.sort_by_key(|s| s.session_id());
         tracing::info!(
             "Run decryption on {} sessions in parallel",
             small_sessions.len()
         );
         let res_store = self.data.ddec_result_store.clone();
+        if vec_ctxts.len() != small_sessions.len() {
+            return Err(tonic::Status::new(
+                tonic::Code::Aborted,
+                format!(
+                    "Number of ctxts ({}) does not match number of sessions ({})",
+                    vec_ctxts.len(),
+                    small_sessions.len()
+                ),
+            ));
+        }
         let my_future = || async move {
             let mut join_set = JoinSet::new();
-            for (ctxts, mut session) in vec_ctxts.into_iter().zip(small_sessions.into_iter()) {
+            for (ctxts, mut session) in vec_ctxts.into_iter().zip_eq(small_sessions.into_iter()) {
                 let key_ref = key_ref.clone();
                 join_set.spawn(
                     async move {
@@ -771,18 +820,18 @@ impl Choreography for ExperimentalGrpcChoreography {
                 }
             }
 
-            res.sort_by_key(|(sid, _)| sid.0);
+            res.sort_by_key(|(sid, _)| *sid);
             let res = res.into_iter().map(|(_, r)| r).collect();
 
             res_store.insert(session_id, res);
-            fill_network_memory_info_multiple_sessions(small_sessions);
+            fill_network_memory_info_multiple_sessions(small_sessions).await;
         };
         self.data.status_store.insert(
             session_id,
             tokio::spawn(my_future().instrument(tracing::Span::current())),
         );
 
-        let sid_serialized = bincode::serialize(&session_id).map_err(|e| {
+        let sid_serialized = bc2wrap::serialize(&session_id).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error serializing session ID {e}"),
@@ -799,7 +848,7 @@ impl Choreography for ExperimentalGrpcChoreography {
         request: tonic::Request<ThresholdDecryptResultRequest>,
     ) -> Result<tonic::Response<ThresholdDecryptResultResponse>, tonic::Status> {
         let request = request.into_inner();
-        let session_id = bincode::deserialize(&request.request_id).map_err(|e| {
+        let session_id = bc2wrap::deserialize_safe(&request.request_id).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error deserializing session_id: {e}"),
@@ -818,7 +867,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             })?
             .clone();
 
-        let res_serialized = bincode::serialize(&res).map_err(|e| {
+        let res_serialized = bc2wrap::serialize(&res).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error serializing answer {e}"),
@@ -835,7 +884,7 @@ impl Choreography for ExperimentalGrpcChoreography {
         request: tonic::Request<StatusCheckRequest>,
     ) -> Result<tonic::Response<StatusCheckResponse>, tonic::Status> {
         let request = request.into_inner();
-        let sid: SessionId = bincode::deserialize(&request.request_id).map_err(|e| {
+        let sid: SessionId = bc2wrap::deserialize_safe(&request.request_id).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error deserializing session_id: {e}"),
@@ -852,7 +901,7 @@ impl Choreography for ExperimentalGrpcChoreography {
             Status::Missing
         };
 
-        let status_serialized = bincode::serialize(&status).map_err(|e| {
+        let status_serialized = bc2wrap::serialize(&status).map_err(|e| {
             tonic::Status::new(
                 tonic::Code::Aborted,
                 format!("Error serializing answer {e}"),
@@ -877,12 +926,24 @@ impl Choreography for ExperimentalGrpcChoreography {
     ) -> Result<tonic::Response<CrsGenResultResponse>, tonic::Status> {
         unimplemented!("BGV Does not have a CRS generation")
     }
+
+    #[instrument(
+        name = "Reshare (BGV)",
+        skip_all,
+        fields(network_round, network_sent, network_received, peak_mem)
+    )]
+    async fn reshare(
+        &self,
+        _request: tonic::Request<ReshareRequest>,
+    ) -> Result<tonic::Response<ReshareResponse>, tonic::Status> {
+        todo!("BGV reshare not implemented yet, need syndrome decode first")
+    }
 }
 
 async fn local_initialize_key_material(
     session: &mut BaseSession,
 ) -> anyhow::Result<(PublicBgvKeySet, PrivateBgvKeySet)> {
-    let own_role = session.my_role()?;
+    let own_role = session.my_role();
     let keyset = if own_role.one_based() == INPUT_PARTY_ID {
         tracing::info!("Keyset generated by input party {}", own_role);
         Some(gen_key_set())

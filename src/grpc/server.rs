@@ -1,17 +1,18 @@
 use crate::algebra::base_ring::{Z128, Z64};
 use crate::algebra::galois_rings::common::ResiduePoly;
-use crate::algebra::structure_traits::{Derive, ErrorCorrect, Invert, Solve};
+use crate::algebra::structure_traits::{Derive, ErrorCorrect, Invert, Solve, Syndrome};
 #[cfg(not(feature = "experimental"))]
 use crate::choreography::grpc::GrpcChoreography;
 use crate::conf::party::PartyConf;
 use crate::execution::online::preprocessing::{create_memory_factory, create_redis_factory};
-use crate::execution::runtime::party::{Identity, RoleAssignment};
+use crate::execution::runtime::party::Role;
 #[cfg(feature = "experimental")]
 use crate::experimental::choreography::grpc::ExperimentalGrpcChoreography;
+#[cfg(not(feature = "experimental"))]
+use crate::malicious_execution::malicious_moby::add_strategy_to_router;
 use crate::networking::constants::NETWORK_TIMEOUT_LONG;
-use crate::networking::grpc::{GrpcNetworkingManager, GrpcServer};
-use crate::networking::Networking;
-use conf_trace::telemetry::make_span;
+use crate::networking::grpc::{GrpcNetworkingManager, GrpcServer, TlsExtensionGetter};
+use observability::telemetry::make_span;
 use std::sync::Arc;
 use tonic::transport::{Server, ServerTlsConfig};
 use tower_http::trace::TraceLayer;
@@ -20,63 +21,29 @@ pub async fn run<const EXTENSION_DEGREE: usize>(
     settings: &PartyConf,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
-    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
+    ResiduePoly<Z64, EXTENSION_DEGREE>: Syndrome + ErrorCorrect + Invert + Solve + Derive,
+    ResiduePoly<Z128, EXTENSION_DEGREE>: Syndrome + ErrorCorrect + Invert + Solve + Derive,
 {
-    // TODO: This part is under discussion. We need to figure out how to handle the networking topology configuration
-    // For the moment we are using a provided configuration on `threshold_decrypt` gRPC endpoint,
-    // but it is not discarded to use a more dynamic approach.
-    let _docker_static_endpoints: RoleAssignment = settings
-        .protocol()
-        .peers()
-        .as_ref()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .map(|peer| (peer.into(), peer.into()))
-        .collect();
+    let my_role: Role = settings.protocol().host().into();
 
-    let own_identity: Identity = settings.protocol().host().into();
+    let tls_conf = settings
+        .certpaths
+        .as_ref()
+        .map(|certpaths| certpaths.get_client_tls_conf())
+        .transpose()?;
 
     // the networking manager is shared between the two services
     let networking = Arc::new(GrpcNetworkingManager::new(
-        own_identity.clone(),
-        settings.certpaths.clone(),
+        tls_conf,
         settings.net_conf,
-    ));
-    let networking_server = networking.new_server();
+        false,
+    )?);
+    let networking_server = networking.new_server(TlsExtensionGetter::TlsConnectInfo);
 
     let factory = match &settings.redis {
         None => create_memory_factory::<EXTENSION_DEGREE>(),
-        Some(conf) => create_redis_factory::<EXTENSION_DEGREE>(format!("{own_identity}"), conf),
+        Some(conf) => create_redis_factory::<EXTENSION_DEGREE>(format!("{my_role}"), conf),
     };
-
-    #[cfg(not(feature = "experimental"))]
-    let choreography = GrpcChoreography::new(
-        own_identity,
-        Box::new(move |session_id, roles, network_mode| {
-            let nm = networking.clone();
-            Box::pin(async move {
-                let impl_networking = nm.make_session(session_id, roles, network_mode);
-                Ok(impl_networking as Arc<dyn Networking + Send + Sync>)
-            })
-        }),
-        factory,
-    )
-    .into_server();
-
-    #[cfg(feature = "experimental")]
-    let choreography = ExperimentalGrpcChoreography::new(
-        own_identity,
-        Box::new(move |session_id, roles, network_mode| {
-            let nm = networking.clone();
-            Box::pin(async move {
-                let impl_networking = nm.make_session(session_id, roles, network_mode);
-                Ok(impl_networking as Arc<dyn Networking + Send + Sync>)
-            })
-        }),
-        factory,
-    )
-    .into_server();
 
     // create a server that uses TLS
     // if [try_use_tls] is true and settings.certpaths is not None
@@ -105,8 +72,7 @@ where
 
     // CHOREO
     // create a future for the choreography server
-    let (mut choreo_health_reporter, choreo_health_service) =
-        tonic_health::server::health_reporter();
+    let (choreo_health_reporter, choreo_health_service) = tonic_health::server::health_reporter();
     choreo_health_reporter.set_serving::<GrpcServer>().await;
 
     let choreo_grpc_layer = tower::ServiceBuilder::new()
@@ -115,8 +81,17 @@ where
 
     let choreo_router = make_server(false)?
         .layer(choreo_grpc_layer)
-        .add_service(choreo_health_service)
-        .add_service(choreography);
+        .add_service(choreo_health_service);
+
+    #[cfg(not(feature = "experimental"))]
+    let choreo_router = add_strategy_to_router(choreo_router, my_role, networking.clone(), factory);
+
+    #[cfg(feature = "experimental")]
+    let choreo_router = {
+        let choreography =
+            ExperimentalGrpcChoreography::new(my_role, networking.clone(), factory).into_server();
+        choreo_router.add_service(choreography)
+    };
 
     tracing::info!(
         "Successfully created choreo server with party id {:?} on port {:?}.",
@@ -132,9 +107,8 @@ where
     // Unfortunately, due to lifetime constraints of GrpcNetworkingManager
     // in async code, we need to keep [networking] in the same scope,
     // so the section below is similar to the "CHOREO" section.
-    let (mut core_health_reporter, core_health_service) = tonic_health::server::health_reporter();
+    let (core_health_reporter, core_health_service) = tonic_health::server::health_reporter();
     core_health_reporter.set_serving::<GrpcServer>().await;
-
     let core_grpc_layer = tower::ServiceBuilder::new().timeout(*NETWORK_TIMEOUT_LONG);
 
     let core_router = make_server(true)?
@@ -169,3 +143,16 @@ where
         _ => Ok(()),
     }
 }
+
+#[cfg(not(feature = "experimental"))]
+pub type SecureGrpcChoreography<const EXTENSION_DEGREE: usize> = GrpcChoreography<
+    EXTENSION_DEGREE,
+    crate::execution::small_execution::prss::RobustSecurePrssInit,
+    crate::execution::small_execution::offline::SecureSmallPreprocessing,
+    crate::execution::large_execution::offline::SecureLargePreprocessing<
+        ResiduePoly<Z64, EXTENSION_DEGREE>,
+    >,
+    crate::execution::large_execution::offline::SecureLargePreprocessing<
+        ResiduePoly<Z128, EXTENSION_DEGREE>,
+    >,
+>;

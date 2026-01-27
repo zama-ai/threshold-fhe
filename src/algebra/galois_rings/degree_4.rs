@@ -1,4 +1,6 @@
 use anyhow::anyhow;
+use itertools::EitherOrBoth::{Both, Left, Right};
+use itertools::Itertools;
 use lazy_static::lazy_static;
 use std::{
     collections::HashMap,
@@ -14,7 +16,8 @@ use crate::algebra::{
     galois_fields::gf16::{two_powers, GF16, GF16_FROM_GENERATOR, GF16_NEWTON_INNER_LOOP},
     poly::{BitWiseEval, BitwisePoly},
     structure_traits::{
-        BaseRing, One, QuotientMaximalIdeal, Ring, RingEmbed, Solve1, ZConsts, Zero,
+        BaseRing, One, QuotientMaximalIdeal, Ring, RingWithExceptionalSequence, Solve1, ZConsts,
+        Zero,
     },
 };
 
@@ -44,6 +47,10 @@ impl<Z: BaseRing> Ring for ResiduePolyF4<Z> {
                 .for_each(|byte| res.push(byte));
         }
         res
+    }
+
+    fn mul_by_u128(self, other: u128) -> Self {
+        self * Z::from_u128(other)
     }
 }
 
@@ -192,8 +199,8 @@ impl<Z: BaseRing> QuotientMaximalIdeal for ResiduePolyF4<Z> {
             .ok_or_else(|| anyhow!("Unexpected index {} for GF16", idx))?;
         Self::bit_lift(*x, pos)
     }
-    fn embed_quotient_exceptional_set(x: GF16) -> anyhow::Result<Self> {
-        Self::embed_exceptional_set(x.0 as usize)
+    fn embed_quotient_exceptional_sequence(x: GF16) -> anyhow::Result<Self> {
+        Self::get_from_exceptional_sequence(x.0 as usize)
     }
 }
 
@@ -205,7 +212,7 @@ impl<Z: BaseRing> Solve1 for ResiduePolyF4<Z> {
         for i in 0..3 {
             res += GF16_NEWTON_INNER_LOOP[i] * v_powers[i];
         }
-        Self::embed_exceptional_set(res.0 as usize)
+        Self::get_from_exceptional_sequence(res.0 as usize)
     }
 }
 
@@ -246,7 +253,7 @@ lazy_static! {
 
 impl MemoizedExceptionals for ResiduePolyF4Z64 {
     fn calculate_powers(index: usize, degree: usize) -> anyhow::Result<Vec<Self>> {
-        let point = Self::embed_exceptional_set(index)?;
+        let point = Self::get_from_exceptional_sequence(index)?;
         Ok(compute_powers(point, degree))
     }
     fn storage() -> &'static RwLock<HashMap<(usize, usize), Vec<Self>>> {
@@ -256,7 +263,7 @@ impl MemoizedExceptionals for ResiduePolyF4Z64 {
 
 impl MemoizedExceptionals for ResiduePolyF4Z128 {
     fn calculate_powers(index: usize, degree: usize) -> anyhow::Result<Vec<Self>> {
-        let point = Self::embed_exceptional_set(index)?;
+        let point = Self::get_from_exceptional_sequence(index)?;
         Ok(compute_powers(point, degree))
     }
     fn storage() -> &'static RwLock<HashMap<(usize, usize), Vec<Self>>> {
@@ -272,12 +279,23 @@ where
     fn lazy_eval(&self, powers: &[ResiduePolyF4<Z>]) -> ResiduePolyF4<Z> {
         let mut res_coefs = [Z::ZERO; 7];
         // now we go through each
-        for (coef_2, coef_r) in self.coefs.iter().zip(powers) {
-            for bit_idx in 0..4 {
-                if ((coef_2 >> bit_idx) & 1) == 1 {
-                    for (j, cr) in coef_r.coefs.iter().enumerate() {
-                        res_coefs[j + bit_idx] += cr;
+        for pair in self.coefs().iter().zip_longest(powers) {
+            match pair {
+                Both(coef_2, coef_r) => {
+                    for bit_idx in 0..4 {
+                        if ((coef_2 >> bit_idx) & 1) == 1 {
+                            for (j, cr) in coef_r.coefs.iter().enumerate() {
+                                res_coefs[j + bit_idx] += cr;
+                            }
+                        }
                     }
+                }
+                Right(_coef_r) => {
+                    // The coefficient is 0 so the result will not change
+                }
+                Left(_coef_2) => {
+                    // There are not enough powers supplied in the call, this can only happen in case of a bug
+                    panic!("Not enough powers supplied for bitwise evaluation. Only {:?} are supplied but {:?} are needed.", powers.len(), self.coefs().len());
                 }
             }
         }
@@ -383,8 +401,8 @@ mod tests {
                 let mut shares = ShamirSharings::share(&mut rng, secret, n, t).unwrap();
                 // t+1 to reconstruct a degree t polynomial
                 // for each error we need to add in 2 honest shares to reconstruct
-                shares.shares[0] = Share::new(Role::indexed_by_zero(0),ResiduePoly::sample(&mut rng));
-                shares.shares[1] = Share::new(Role::indexed_by_zero(1),ResiduePoly::sample(&mut rng));
+                shares.shares[0] = Share::new(Role::indexed_from_zero(0),ResiduePoly::sample(&mut rng));
+                shares.shares[1] = Share::new(Role::indexed_from_zero(1),ResiduePoly::sample(&mut rng));
 
                 let recon = ResiduePolyF4::<$z>::error_correct(&shares,t, 1);
                 let _ =
@@ -803,8 +821,8 @@ mod tests {
             #[test]
             fn [<test_shift_ $z:lower>]() {
                 assert_eq!(
-                    ResiduePolyF4::<$z>::embed_exceptional_set(13).unwrap(),
-                    ResiduePolyF4::<$z>::embed_exceptional_set(13).unwrap() << 0,
+                    ResiduePolyF4::<$z>::get_from_exceptional_sequence(13).unwrap(),
+                    ResiduePolyF4::<$z>::get_from_exceptional_sequence(13).unwrap() << 0,
                     "Fail 1"
                 );
                 assert_eq!(
@@ -826,7 +844,7 @@ mod tests {
                         $z::ZERO,
                     ])
                     .unwrap(),
-                    ResiduePolyF4::<$z>::embed_exceptional_set(2).unwrap() << 1,
+                    ResiduePolyF4::<$z>::get_from_exceptional_sequence(2).unwrap() << 1,
                     "Fail 4"
                 );
             }
@@ -846,7 +864,7 @@ mod tests {
         input = 3;
         reference.coefs[0] = Wrapping(1);
         reference.coefs[1] = Wrapping(1);
-        res = ResiduePolyF4::embed_exceptional_set(input).unwrap();
+        res = ResiduePolyF4::get_from_exceptional_sequence(input).unwrap();
         assert_eq!(reference, res);
 
         // Set the polynomial to x^2, i.e. 0b0100 = 4
@@ -856,14 +874,14 @@ mod tests {
         reference.coefs[1] = Wrapping(0);
         reference.coefs[2] = Wrapping(1);
         reference.coefs[3] = Wrapping(0);
-        res = ResiduePolyF4::embed_exceptional_set(input).unwrap();
+        res = ResiduePolyF4::get_from_exceptional_sequence(input).unwrap();
         assert_eq!(reference, res);
 
         // Set the polynomial to x^3, i.e. 0b1000 = 8
         input = 8;
         reference = ResiduePolyF4::ZERO;
         reference.coefs[3] = Wrapping(1);
-        res = ResiduePolyF4::embed_exceptional_set(input).unwrap();
+        res = ResiduePolyF4::get_from_exceptional_sequence(input).unwrap();
         assert_eq!(reference, res);
     }
 

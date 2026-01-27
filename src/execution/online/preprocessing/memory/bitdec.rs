@@ -7,11 +7,11 @@ use crate::{
 
 use super::{BasePreprocessing, TriplePreprocessing};
 use crate::execution::online::gen_bits::BitGenEven;
-use crate::execution::online::gen_bits::RealBitGenEven;
+use crate::execution::online::gen_bits::SecureBitGenEven;
 use crate::execution::online::preprocessing::BitPreprocessing;
 use crate::execution::online::preprocessing::{BitDecPreprocessing, InMemoryBitDecPreprocessing};
 use crate::execution::online::triple::Triple;
-use crate::execution::runtime::session::BaseSession;
+use crate::execution::runtime::sessions::base_session::BaseSession;
 use async_trait::async_trait;
 
 impl<const EXTENSION_DEGREE: usize> TriplePreprocessing<ResiduePoly<Z64, EXTENSION_DEGREE>>
@@ -58,17 +58,15 @@ impl<const EXTENSION_DEGREE: usize> BitPreprocessing<ResiduePoly<Z64, EXTENSION_
         &mut self,
         amount: usize,
     ) -> anyhow::Result<Vec<Share<ResiduePoly<Z64, EXTENSION_DEGREE>>>> {
-        if self.available_bits.len() >= amount {
-            let mut res = Vec::with_capacity(amount);
-            for _ in 0..amount {
-                res.push(self.next_bit()?);
-            }
-            Ok(res)
-        } else {
-            Err(anyhow_error_and_log(format!(
-                "Not enough bits to pop {amount}"
-            )))
+        if self.available_bits.len() < amount {
+            return Err(anyhow_error_and_log(format!(
+                "Not enough bits to pop {amount}, have {}",
+                self.available_bits.len()
+            )));
         }
+
+        // Use drain to safely extract exactly 'amount' bits
+        Ok(self.available_bits.drain(0..amount).collect())
     }
 
     fn bits_len(&self) -> usize {
@@ -91,7 +89,7 @@ where
         num_ctxts: usize,
     ) -> anyhow::Result<()> {
         //Need 64 bits per ctxt
-        let bit_vec = RealBitGenEven::gen_bits_even(
+        let bit_vec = SecureBitGenEven::gen_bits_even(
             self.num_required_bits(num_ctxts),
             preprocessing,
             session,
@@ -106,9 +104,75 @@ where
     }
 
     fn cast_to_in_memory_impl(&mut self, num_ctxts: usize) -> anyhow::Result<Self> {
+        let num_bits = self.num_required_bits(num_ctxts);
+        let num_triples = self.num_required_triples(num_ctxts);
+
+        if self.bits_len() < num_bits {
+            return Err(anyhow_error_and_log(format!(
+                "Not enough bits available: {} < {}",
+                self.bits_len(),
+                num_bits
+            )));
+        }
+        if self.triples_len() < num_triples {
+            return Err(anyhow_error_and_log(format!(
+                "Not enough triples available: {} < {}",
+                self.triples_len(),
+                num_triples
+            )));
+        }
+
+        // Safe to unwrap as we just checked the lengths
         Ok(Self {
-            available_triples: self.next_triple_vec(self.num_required_triples(num_ctxts))?,
-            available_bits: self.next_bit_vec(self.num_required_bits(num_ctxts))?,
+            available_triples: self.next_triple_vec(num_triples).unwrap(),
+            available_bits: self.next_bit_vec(num_bits).unwrap(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        algebra::galois_rings::degree_4::ResiduePolyF4Z64,
+        execution::online::preprocessing::dummy::DummyPreprocessing, networking::NetworkMode,
+        tests::helper::tests::get_base_session,
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_cast_fail_memory_bit_dec_preprocessing() {
+        let session = get_base_session(NetworkMode::Sync);
+        let mut dummy_preprocessing = DummyPreprocessing::<ResiduePolyF4Z64>::new(42, &session);
+
+        let casted_from_dummy = dummy_preprocessing.cast_to_in_memory_impl(1).unwrap();
+
+        let mut in_memory_bit_dec_preprocessing = InMemoryBitDecPreprocessing {
+            available_triples: casted_from_dummy.available_triples,
+            available_bits: Vec::new(),
+        };
+
+        assert!(
+            in_memory_bit_dec_preprocessing
+                .cast_to_in_memory_impl(1)
+                .unwrap_err()
+                .to_string()
+                .contains("Not enough bits available"),
+            "Casting to in memory impl should fail when not enough bits are available"
+        );
+
+        let mut in_memory_bit_dec_preprocessing = InMemoryBitDecPreprocessing {
+            available_triples: Vec::new(),
+            available_bits: casted_from_dummy.available_bits,
+        };
+
+        assert!(
+            in_memory_bit_dec_preprocessing
+                .cast_to_in_memory_impl(1)
+                .unwrap_err()
+                .to_string()
+                .contains("Not enough triples available"),
+            "Casting to in memory impl should fail when not enough triples are available"
+        );
     }
 }

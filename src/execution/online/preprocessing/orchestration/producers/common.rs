@@ -1,63 +1,34 @@
-use std::{future::Future, marker::PhantomData};
+use std::future::Future;
 
-use aes_prng::AesRng;
-use rand::{CryptoRng, Rng};
 use tokio::{sync::mpsc::Sender, task::JoinSet};
 use tracing::Instrument;
 
-use crate::{
-    algebra::structure_traits::Ring,
-    execution::{
-        online::preprocessing::orchestration::progress_tracker::ProgressTracker,
-        runtime::session::{BaseSessionHandles, LargeSession, SmallSession},
-    },
+use crate::execution::{
+    online::preprocessing::orchestration::progress_tracker::ProgressTracker,
+    runtime::sessions::base_session::BaseSessionHandles,
 };
 
 /// Struct that holds a session
 /// and an outgoing channel
 /// which will be filled with the result
 /// of that session
-pub(crate) struct ProducerSession<
-    Rnd: Rng + CryptoRng + Sync + 'static,
-    S: BaseSessionHandles<Rnd>,
-    T,
-> {
+pub(crate) struct ProducerSession<S: BaseSessionHandles, T> {
     session: S,
     sender_channel: Sender<T>,
-    _marker: PhantomData<Rnd>,
 }
 
-pub(crate) type ProducerSmallSession<Z, T> = ProducerSession<AesRng, SmallSession<Z>, T>;
-pub(crate) type ProducerLargeSession<T> = ProducerSession<AesRng, LargeSession, T>;
-
-impl<Z: Ring, T> ProducerSmallSession<Z, T> {
-    pub(crate) fn new(session: SmallSession<Z>, sender_channel: Sender<T>) -> Self {
+impl<S: BaseSessionHandles, T> ProducerSession<S, T> {
+    pub(crate) fn new(session: S, sender_channel: Sender<T>) -> Self {
         Self {
             session,
             sender_channel,
-            _marker: PhantomData::<AesRng>,
-        }
-    }
-}
-
-impl<T> ProducerLargeSession<T> {
-    pub(crate) fn new(session: LargeSession, sender_channel: Sender<T>) -> Self {
-        Self {
-            session,
-            sender_channel,
-            _marker: PhantomData::<AesRng>,
         }
     }
 }
 
 ///Generic functions that spawn the threads for processing
-pub(crate) fn execute_preprocessing<
-    Rnd: Rng + CryptoRng + Sync + 'static,
-    C,
-    S: BaseSessionHandles<Rnd> + 'static,
-    TaskOutput,
->(
-    producer_sessions: Vec<ProducerSession<Rnd, S, C>>,
+pub(crate) fn execute_preprocessing<C, S: BaseSessionHandles + 'static, TaskOutput>(
+    producer_sessions: Vec<ProducerSession<S, C>>,
     task_gen: impl Fn(S, Sender<C>, Option<ProgressTracker>) -> TaskOutput,
     progress_tracker: Option<ProgressTracker>,
 ) -> JoinSet<Result<S, anyhow::Error>>
@@ -83,8 +54,9 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{fmt::Display, sync::Arc, thread};
+    use std::{collections::HashSet, fmt::Display, sync::Arc, thread};
 
+    use futures::future::join_all;
     use itertools::Itertools;
     use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -97,13 +69,16 @@ pub(crate) mod tests {
         execution::{
             online::{
                 preprocessing::orchestration::{
+                    producer_traits::{BitProducerTrait, RandomProducerTrait, TripleProducerTrait},
                     producers::{
-                        bits_producer::{LargeSessionBitProducer, SmallSessionBitProducer},
+                        bits_producer::{
+                            SecureLargeSessionBitProducer, SecureSmallSessionBitProducer,
+                        },
                         randoms_producer::{
-                            LargeSessionRandomProducer, SmallSessionRandomProducer,
+                            SecureLargeSessionRandomProducer, SecureSmallSessionRandomProducer,
                         },
                         triples_producer::{
-                            LargeSessionTripleProducer, SmallSessionTripleProducer,
+                            SecureLargeSessionTripleProducer, SecureSmallSessionTripleProducer,
                         },
                     },
                     progress_tracker::ProgressTracker,
@@ -111,8 +86,8 @@ pub(crate) mod tests {
                 triple::Triple,
             },
             runtime::{
-                party::Identity,
-                test_runtime::{generate_fixed_identities, DistributedTestRuntime},
+                party::Role,
+                test_runtime::{generate_fixed_roles, DistributedTestRuntime},
             },
             sharing::share::Share,
         },
@@ -145,7 +120,7 @@ pub(crate) mod tests {
                 Typeproduction::Randoms => "Randoms",
                 Typeproduction::Bits => "Bits",
             };
-            write!(f, "{}", s)
+            write!(f, "{s}")
         }
     }
 
@@ -193,45 +168,45 @@ pub(crate) mod tests {
         threshold: u8,
         type_production: Typeproduction,
     ) -> (
-        Vec<Identity>,
+        HashSet<Role>,
         Vec<ReceiverChannelCollectionWithTracker<ResiduePoly<Z64, EXTENSION_DEGREE>>>,
     )
     where
         ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
         ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
     {
-        //Create identities and runtime
-        let identities = generate_fixed_identities(num_parties);
+        // Create roles  and runtime
+        let roles = generate_fixed_roles(num_parties);
         // Preprocessing assumes Sync network
-        let runtimes =
-            (0..num_sessions)
-                .map(|_| {
-                    DistributedTestRuntime::<
+        let runtimes = (0..num_sessions)
+            .map(|_| {
+                DistributedTestRuntime::<
                     ResiduePoly<Z64, EXTENSION_DEGREE>,
+                    Role,
                     EXTENSION_DEGREE ,
-                >::new(identities.clone(), threshold, NetworkMode::Sync, None)
-                })
-                .collect_vec();
+                >::new(roles.clone(), threshold, NetworkMode::Sync, None)
+            })
+            .collect_vec();
         let runtimes = Arc::new(runtimes);
 
         let mut handles = OsThreadGroup::new();
 
         //For test runtime we need multiple runtimes for mutltiple channels
         let rt = tokio::runtime::Runtime::new().unwrap();
-        for party_id in 0..num_parties {
+        for party in roles.clone() {
             let runtimes = runtimes.clone();
             let rt_handle = rt.handle().clone();
             handles.add(thread::spawn(move || {
                 //inside a party
                 let _guard = rt_handle.enter();
-                println!("Thread created for {party_id}");
+                println!("Thread created for party {party}");
 
                 //For each party, create num_sessions sessions
                 let sessions = runtimes
                     .iter()
-                    .zip(0..num_sessions)
+                    .zip_eq(0..num_sessions)
                     .map(|(runtime, session_id)| {
-                        runtime.large_session_for_party(SessionId(session_id), party_id)
+                        runtime.large_session_for_party(SessionId::from(session_id), party)
                     })
                     .collect_vec();
 
@@ -245,7 +220,7 @@ pub(crate) mod tests {
                     ProgressTracker::new(&type_production.to_string(), num_correlations, 100);
                 let mut joinset = match type_production {
                     Typeproduction::Triples => {
-                        let triple_producer = LargeSessionTripleProducer::new(
+                        let triple_producer = SecureLargeSessionTripleProducer::new(
                             batch_size,
                             num_correlations,
                             sessions,
@@ -256,7 +231,7 @@ pub(crate) mod tests {
                         triple_producer.start_triple_production()
                     }
                     Typeproduction::Randoms => {
-                        let random_producer = LargeSessionRandomProducer::new(
+                        let random_producer = SecureLargeSessionRandomProducer::new(
                             batch_size,
                             num_correlations,
                             sessions,
@@ -267,7 +242,7 @@ pub(crate) mod tests {
                         random_producer.start_random_production()
                     }
                     Typeproduction::Bits => {
-                        let bit_producer = LargeSessionBitProducer::new(
+                        let bit_producer = SecureLargeSessionBitProducer::new(
                             batch_size,
                             num_correlations,
                             sessions,
@@ -293,7 +268,7 @@ pub(crate) mod tests {
         let mut channels = Vec::new();
         channels.extend(handles.join_all_with_results().unwrap());
 
-        (identities, channels)
+        (roles, channels)
     }
 
     pub fn test_production_small<const EXTENSION_DEGREE: usize>(
@@ -304,24 +279,23 @@ pub(crate) mod tests {
         threshold: u8,
         type_production: Typeproduction,
     ) -> (
-        Vec<Identity>,
+        HashSet<Role>,
         Vec<ReceiverChannelCollectionWithTracker<ResiduePoly<Z64, EXTENSION_DEGREE>>>,
     )
     where
         ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
         ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
     {
-        //Create identities and runtime
-        let identities = generate_fixed_identities(num_parties);
+        // Create identities and runtime
+        let roles = generate_fixed_roles(num_parties);
         // Preprocessing assumes Sync network
         let runtimes = (0..num_sessions)
             .map(|_| {
-                DistributedTestRuntime::<ResiduePoly<Z64, EXTENSION_DEGREE>, EXTENSION_DEGREE>::new(
-                    identities.clone(),
-                    threshold,
-                    NetworkMode::Sync,
-                    None,
-                )
+                DistributedTestRuntime::<
+                        ResiduePoly<Z64,  EXTENSION_DEGREE>,
+                        Role,
+                        EXTENSION_DEGREE,
+                    >::new(roles.clone(), threshold, NetworkMode::Sync, None)
             })
             .collect_vec();
         let runtimes = Arc::new(runtimes);
@@ -329,21 +303,24 @@ pub(crate) mod tests {
         let mut handles = OsThreadGroup::new();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        for party_id in 0..num_parties {
+        for party in roles.clone() {
             let runtimes = runtimes.clone();
             let rt_handle = rt.handle().clone();
             handles.add(thread::spawn(move || {
                 let _guard = rt_handle.enter();
-                println!("Thread created for {party_id}");
+                println!("Thread created for party {party}");
 
                 //For each party, create num_sessions sessions
-                let sessions = runtimes
-                    .iter()
-                    .zip(0..num_sessions)
-                    .map(|(runtime, session_id)| {
-                        runtime.small_session_for_party(SessionId(session_id), party_id, None)
-                    })
-                    .collect_vec();
+                let sessions =
+                    rt_handle.block_on(join_all(runtimes.iter().zip_eq(0..num_sessions).map(
+                        |(runtime, session_id)| {
+                            runtime.small_session_for_party(
+                                SessionId::from(session_id),
+                                party,
+                                None,
+                            )
+                        },
+                    )));
 
                 let (
                     (triple_sender_channels, triple_receiver_channels),
@@ -355,7 +332,7 @@ pub(crate) mod tests {
                     ProgressTracker::new(&type_production.to_string(), num_correlations, 100);
                 let mut joinset = match type_production {
                     Typeproduction::Triples => {
-                        let triple_producer = SmallSessionTripleProducer::new(
+                        let triple_producer = SecureSmallSessionTripleProducer::new(
                             batch_size,
                             num_correlations,
                             sessions,
@@ -366,7 +343,7 @@ pub(crate) mod tests {
                         triple_producer.start_triple_production()
                     }
                     Typeproduction::Randoms => {
-                        let random_producer = SmallSessionRandomProducer::new(
+                        let random_producer = SecureSmallSessionRandomProducer::new(
                             batch_size,
                             num_correlations,
                             sessions,
@@ -377,7 +354,7 @@ pub(crate) mod tests {
                         random_producer.start_random_production()
                     }
                     Typeproduction::Bits => {
-                        let bit_producer = SmallSessionBitProducer::new(
+                        let bit_producer = SecureSmallSessionBitProducer::new(
                             batch_size,
                             num_correlations,
                             sessions,
@@ -403,6 +380,6 @@ pub(crate) mod tests {
         let mut channels = Vec::new();
         channels.extend(handles.join_all_with_results().unwrap());
 
-        (identities, channels)
+        (roles, channels)
     }
 }

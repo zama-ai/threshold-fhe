@@ -1,19 +1,20 @@
 use itertools::Itertools;
-use rand::{CryptoRng, Rng};
+use std::sync::Arc;
 use tonic::async_trait;
-use tracing::{info_span, instrument};
+use tracing::instrument;
 
 use crate::{
-    algebra::structure_traits::{ErrorCorrect, Invert, Ring, RingEmbed, ZConsts},
+    algebra::structure_traits::{ErrorCorrect, Invert, ZConsts},
+    error::error_handler::anyhow_error_and_log,
     execution::{
         constants::STATSEC,
         online::{
             preprocessing::BasePreprocessing,
             triple::{mult_list, open_list},
         },
-        runtime::session::SmallSessionHandles,
+        runtime::sessions::small_session::SmallSessionHandles,
         sharing::share::Share,
-        small_execution::prf::PRSSConversions,
+        small_execution::{prf::PRSSConversions, prss::PRSSPrimitives},
     },
 };
 
@@ -30,9 +31,8 @@ pub trait BitGenOdd {
     //To generate bits with an odd modulus q = q_1*...*q_L we need to compute
     //a sqrt mod q_L cf ['SqrtLargestPrimeFactor']
     async fn gen_bits_odd<
-        Z: Ring + RingEmbed + Invert + ErrorCorrect + LargestPrimeFactor + ZConsts + PRSSConversions,
-        Rnd: Rng + CryptoRng,
-        Ses: SmallSessionHandles<Z, Rnd>,
+        Z: Invert + ErrorCorrect + LargestPrimeFactor + ZConsts + PRSSConversions,
+        Ses: SmallSessionHandles<Z>,
         P: BasePreprocessing<Z> + Send + ?Sized,
     >(
         amount: usize,
@@ -47,11 +47,10 @@ pub struct RealBitGenOdd {}
 impl BitGenOdd for RealBitGenOdd {
     /// Generates a vector of secret shared random bits using a preprocessing functionality and a session.
     /// The code only works when the modulo of the ring used is odd.
-    #[instrument(name="MPC.GenBits",skip(amount, preproc, session), fields(sid = ?session.session_id(), own_identity= ?session.own_identity(), batch_size=?amount))]
+    #[instrument(name="MPC.GenBits",skip(amount, preproc, session), fields(sid = ?session.session_id(), my_role= ?session.my_role(), batch_size=?amount))]
     async fn gen_bits_odd<
-        Z: Ring + RingEmbed + Invert + ErrorCorrect + LargestPrimeFactor + ZConsts + PRSSConversions,
-        Rnd: Rng + CryptoRng,
-        Ses: SmallSessionHandles<Z, Rnd>,
+        Z: Invert + ErrorCorrect + LargestPrimeFactor + ZConsts + PRSSConversions,
+        Ses: SmallSessionHandles<Z>,
         P: BasePreprocessing<Z> + Send + ?Sized,
     >(
         amount: usize,
@@ -59,7 +58,7 @@ impl BitGenOdd for RealBitGenOdd {
         session: &mut Ses,
     ) -> anyhow::Result<Vec<Share<Z>>> {
         let two_inv = Z::TWO.invert()?;
-        let own_role = session.my_role()?;
+        let own_role = session.my_role();
 
         let mut s_vec = Vec::with_capacity(amount);
         let mut a_vec = Vec::with_capacity(amount);
@@ -67,14 +66,24 @@ impl BitGenOdd for RealBitGenOdd {
         //Open enough non-zero squares, and corresponding secret square roots
         while s_vec.len() != amount {
             let current_amount = amount - s_vec.len();
-            let tmp_a_vec = preproc.next_random_vec(current_amount)?;
+            let tmp_a_vec = Arc::new(preproc.next_random_vec(current_amount)?);
             let trips = preproc.next_triple_vec(current_amount)?;
 
-            let tmp_s_vec = mult_list(&tmp_a_vec, &tmp_a_vec, trips, session).await?;
+            let tmp_s_vec = mult_list(
+                Arc::clone(&tmp_a_vec),
+                Arc::clone(&tmp_a_vec),
+                trips,
+                session,
+            )
+            .await?;
+
             let tmp_s_vec = open_list(&tmp_s_vec, session).await?;
+
+            let tmp_a_vec = Arc::into_inner(tmp_a_vec)
+                .ok_or_else(|| anyhow_error_and_log("Failed to unarc tmp_a_vec"))?;
             tmp_s_vec
                 .into_iter()
-                .zip(tmp_a_vec.into_iter())
+                .zip_eq(tmp_a_vec.into_iter()) // May panic, but would imply a bug in `mult_list`
                 .filter(|(s, _)| Z::largest_prime_factor_non_zero(s))
                 .for_each(|(s, a)| {
                     s_vec.push(s);
@@ -87,7 +96,7 @@ impl BitGenOdd for RealBitGenOdd {
 
         let v_vec: Vec<Share<Z>> = a_vec
             .into_iter()
-            .zip(c_vec.iter())
+            .zip_eq(c_vec.iter()) // May panic, but would imply a bug in this method`
             .map(|(a, c)| match c.invert() {
                 Ok(c_inv) => Ok(a * c_inv),
                 Err(e) => Err(e),
@@ -103,10 +112,9 @@ impl BitGenOdd for RealBitGenOdd {
         let r_vec: Vec<Z> = {
             let prss_state = session.prss_as_mut();
 
-            let prss_span = info_span!("PRSS-MASK.Next", batch_size = amount);
-            prss_span
-                .in_scope(|| (0..amount).map(|_| prss_state.mask_next(own_role, 1)))
-                .try_collect::<_, Vec<Z>, _>()?
+            prss_state
+                .mask_next_vec(own_role, 1, amount)
+                .await?
                 .into_iter()
                 .map(|x| x + dist_shift)
                 .collect()
@@ -114,7 +122,7 @@ impl BitGenOdd for RealBitGenOdd {
 
         let c_vec = b_vec
             .iter()
-            .zip(r_vec.iter())
+            .zip_eq(r_vec.iter()) // May panic, but would imply a bug in this method
             .map(|(b, r)| b + r)
             .collect_vec();
 
@@ -123,7 +131,7 @@ impl BitGenOdd for RealBitGenOdd {
 
         let result = t_vec
             .into_iter()
-            .zip(r_vec)
+            .zip_eq(r_vec) // May panic, but would imply a bug in this method
             .map(|(t, r)| Share::new(own_role, t - r))
             .collect();
 
@@ -133,13 +141,12 @@ impl BitGenOdd for RealBitGenOdd {
 
 #[cfg(test)]
 mod tests {
-    use aes_prng::AesRng;
 
     use crate::{
-        algebra::structure_traits::{One, Zero},
+        algebra::structure_traits::{One, Ring, Zero},
         execution::{
             online::preprocessing::dummy::DummyPreprocessing,
-            runtime::session::SmallSession,
+            runtime::sessions::small_session::SmallSession,
             sharing::shamir::{RevealOp, ShamirSharings},
         },
         experimental::algebra::levels::LevelKsw,
@@ -149,16 +156,13 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_bitgen() {
+    #[tokio::test]
+    async fn test_bitgen() {
         let parties = 4;
         let threshold = 1;
         let amount = 100;
         let mut task = |mut session: SmallSession<LevelKsw>, _bot: Option<String>| async move {
-            let mut preproc = DummyPreprocessing::<LevelKsw, AesRng, SmallSession<LevelKsw>>::new(
-                0,
-                session.clone(),
-            );
+            let mut preproc = DummyPreprocessing::<LevelKsw>::new(0, &session);
 
             RealBitGenOdd::gen_bits_odd(amount, &mut preproc, &mut session)
                 .await
@@ -176,7 +180,8 @@ mod tests {
             Some(delay_vec),
             &mut task,
             None,
-        );
+        )
+        .await;
 
         //Make sure all are bits
         let mut one_count = 0;

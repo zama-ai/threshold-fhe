@@ -1,9 +1,11 @@
 use super::share::Share;
 use crate::algebra::poly::Poly;
-use crate::algebra::structure_traits::{ErrorCorrect, RingEmbed};
+use crate::algebra::structure_traits::{ErrorCorrect, Ring, RingWithExceptionalSequence};
+use crate::error::error_handler::anyhow_error_and_log;
 use crate::error::error_handler::anyhow_error_and_warn_log;
 use crate::execution::runtime::party::Role;
-use crate::{algebra::structure_traits::Ring, error::error_handler::anyhow_error_and_log};
+use itertools::EitherOrBoth::{Both, Left, Right};
+use itertools::Itertools;
 use rand::{CryptoRng, Rng};
 use std::ops::{Add, Mul, Sub};
 
@@ -15,12 +17,6 @@ pub trait HenselLiftInverse: Sized {
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct ShamirSharings<Z: Ring> {
     pub shares: Vec<Share<Z>>,
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub struct ShamirSharing<T> {
-    pub share: T,
-    pub party_id: u8,
 }
 
 pub type ShamirFieldPoly<F> = Poly<F>;
@@ -37,19 +33,19 @@ impl<Z: Ring> ShamirSharings<Z> {
         ShamirSharings { shares }
     }
 
-    //Add a single share in the correct spot to keep ordering
-    pub fn add_share(&mut self, share: Share<Z>) -> anyhow::Result<()> {
+    /// Add a single share in the correct spot to keep ordering
+    /// If a share for the same party already exists, we replace it.
+    /// WARNING: When calling this function, be sure that the Role is trusted!
+    pub fn add_share(&mut self, share: Share<Z>) {
         match self
             .shares
             .binary_search_by_key(&share.owner(), |s| s.owner())
         {
-            Ok(_pos) => Err(anyhow_error_and_log(
-                "Trying to insert two shares for the same party".to_string(),
-            )),
-            Err(pos) => {
-                self.shares.insert(pos, share);
-                Ok(())
+            Ok(pos) => {
+                tracing::warn!("Replacing a share for {}", share.owner());
+                self.shares[pos] = share
             }
+            Err(pos) => self.shares.insert(pos, share),
         }
     }
 }
@@ -57,13 +53,18 @@ impl<Z: Ring> ShamirSharings<Z> {
 impl<Z: Ring> Add<ShamirSharings<Z>> for ShamirSharings<Z> {
     type Output = ShamirSharings<Z>;
     fn add(self, rhs: ShamirSharings<Z>) -> Self::Output {
+        let pair = self.shares.into_iter().zip_longest(rhs.shares);
         ShamirSharings {
-            shares: self
-                .shares
-                .into_iter()
-                .zip(rhs.shares)
-                .map(|(a, b)| a + b)
-                .collect(),
+            shares: pair
+                .map(|cur| {
+                    match cur {
+                        Both(a, b) => a + b,
+                        // If only one side has a share, we interpret the other side as zero
+                        Left(a) => a,
+                        Right(b) => b,
+                    }
+                })
+                .collect_vec(),
         }
     }
 }
@@ -71,16 +72,21 @@ impl<Z: Ring> Add<ShamirSharings<Z>> for ShamirSharings<Z> {
 impl<Z: Ring> Add<&ShamirSharings<Z>> for &ShamirSharings<Z> {
     type Output = ShamirSharings<Z>;
     fn add(self, rhs: &ShamirSharings<Z>) -> Self::Output {
+        let pair = self.shares.iter().zip_longest(rhs.shares.iter());
         ShamirSharings {
-            shares: self
-                .shares
-                .iter()
-                .zip(rhs.shares.iter())
-                .map(|(a, b)| {
-                    assert_eq!(a.owner(), b.owner());
-                    Share::new(a.owner(), a.value() + b.value())
+            shares: pair
+                .map(|cur| {
+                    match cur {
+                        Both(a, b) => {
+                            assert_eq!(a.owner(), b.owner());
+                            Share::new(a.owner(), a.value() + b.value())
+                        }
+                        // If only one side has a share, we interpret the other side as zero
+                        Left(a) => Share::new(a.owner(), a.value()),
+                        Right(b) => Share::new(b.owner(), b.value()),
+                    }
                 })
-                .collect(),
+                .collect_vec(),
         }
     }
 }
@@ -88,16 +94,21 @@ impl<Z: Ring> Add<&ShamirSharings<Z>> for &ShamirSharings<Z> {
 impl<Z: Ring> Sub<&ShamirSharings<Z>> for &ShamirSharings<Z> {
     type Output = ShamirSharings<Z>;
     fn sub(self, rhs: &ShamirSharings<Z>) -> Self::Output {
+        let pair = self.shares.iter().zip_longest(rhs.shares.iter());
         ShamirSharings {
-            shares: self
-                .shares
-                .iter()
-                .zip(rhs.shares.iter())
-                .map(|(a, b)| {
-                    assert_eq!(a.owner(), b.owner());
-                    Share::new(a.owner(), a.value() - b.value())
+            shares: pair
+                .map(|cur| {
+                    match cur {
+                        Both(a, b) => {
+                            assert_eq!(a.owner(), b.owner());
+                            Share::new(a.owner(), a.value() - b.value())
+                        }
+                        // If only one side has a share, we interpret the other side as zero
+                        Left(a) => Share::new(a.owner(), a.value()),
+                        Right(b) => Share::new(b.owner(), b.value()),
+                    }
                 })
-                .collect(),
+                .collect_vec(),
         }
     }
 }
@@ -144,8 +155,7 @@ pub trait InputOp<T> {
 
 impl<Z> InputOp<Z> for ShamirSharings<Z>
 where
-    Z: Ring,
-    Z: RingEmbed,
+    Z: RingWithExceptionalSequence,
 {
     //NIST: Level Zero Operation
     fn share<R: Rng + CryptoRng>(
@@ -156,19 +166,22 @@ where
     ) -> anyhow::Result<Self> {
         if threshold >= num_parties {
             anyhow::bail!(
-                "number of parties {num_parties} must be less than the threshold {threshold}"
+                "number of parties {num_parties} must be strictly bigger than the threshold {threshold}"
             );
         }
-        let poly = Poly::sample_random_with_fixed_constant(rng, secret, threshold);
-        let shares: Vec<_> = (1..=num_parties)
-            .map(|xi| {
-                let embedded_xi: Z = Z::embed_exceptional_set(xi)?;
-                Ok(Share::new(
-                    Role::indexed_by_one(xi),
-                    poly.eval(&embedded_xi),
-                ))
+        let role_with_embeddings = (1..=num_parties)
+            .map(|party_id| {
+                let party = Role::indexed_from_one(party_id);
+                let embedding = Z::embed_role_to_exceptional_sequence(&party)?;
+                Ok((party, embedding))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let poly = Poly::sample_random_with_fixed_constant(rng, secret, threshold);
+        let shares: Vec<_> = role_with_embeddings
+            .into_iter()
+            .map(|(role, embedded_role)| Share::new(role, poly.eval(&embedded_role)))
+            .collect::<Vec<_>>();
 
         Ok(ShamirSharings { shares })
     }
@@ -192,30 +205,56 @@ where
     }
 }
 
-/// Maps `values` into [ShamirSharings]s by appending these to `sharings`.
-/// Furthermore, ensure that at least `num_values` shares are added to `sharings`.
-/// The function is useful to ensure that an indexiable vector of Shamir shares exist.
+/// Maps `values` into [ShamirSharings]s by pairwise adding each of these to each of the `sharings`.
+/// Furthermore, adds a zero-share for each share in `sharings` if there is not supplied enough `values`.
+/// This in turn means that there will be `num_values` shares in `sharings`.
+/// The function is useful to ensure that an indexable vector of Shamir shares exist.
 pub fn fill_indexed_shares<Z: Ring>(
     sharings: &mut [ShamirSharings<Z>],
     values: Vec<Z>,
     num_values: usize,
     party_id: Role,
 ) -> anyhow::Result<()> {
-    let values_len = values.len();
-    values
-        .into_iter()
-        .zip(sharings.iter_mut())
-        .try_for_each(|(v, sharing)| sharing.add_share(Share::new(party_id, v)))?;
-
-    if values_len < num_values {
-        tracing::warn!(
-            "Received {} shares from {} but expected {}. Filling with 0s",
-            values_len,
+    if sharings.len() != num_values {
+        return Err(anyhow_error_and_log(format!(
+            "Number of sharings {} is not the expected amount {} from party {}",
+            sharings.len(),
             num_values,
             party_id
-        );
-        for sharing in sharings.iter_mut().skip(values_len) {
-            sharing.add_share(Share::new(party_id, Z::ZERO))?;
+        )));
+    }
+    if sharings.len() < values.len() {
+        return Err(anyhow_error_and_log(format!(
+            "Number of sharings {} is not {} as expected from party {}.",
+            sharings.len(),
+            values.len(),
+            party_id
+        )));
+    }
+    let sharing_len = sharings.len();
+    let values_len = values.len();
+    let pair = values.into_iter().zip_longest(sharings.iter_mut());
+    for cur in pair {
+        match cur {
+            Both(v, sharing) => {
+                sharing.add_share(Share::new(party_id, v));
+            }
+            Left(_v) => {
+                // If a share is missing, we panic since we already checked the lengths in the start of the method
+                panic!(
+                    "There are {sharing_len} shares, but {values_len} values. There should not be more values than shares from party {party_id}."
+                );
+            }
+            Right(sharing) => {
+                // If a value is missing, then add a zero-share in liu of the value
+                tracing::warn!(
+                    "Received {} shares from {} but expected {}. Filling with 0s",
+                    values_len,
+                    party_id,
+                    num_values
+                );
+                sharing.add_share(Share::new(party_id, Z::ZERO));
+            }
         }
     }
     Ok(())
@@ -227,7 +266,7 @@ pub fn fill_indexed_shares<Z: Ring>(
 /// - num_parties as number of parties
 /// - degree as the degree of the sharing (usually either t or 2t)
 /// - threshold as the threshold of maximum corruptions
-/// - num_bots as the number of known Bot (known wrong values) contributions
+/// - num_bots as the number of known Bot (known wrong/empty values) contributions
 /// - indexed_shares as the indexed shares of the parties
 ///
 /// Returns either the result or None if there are not enough shares to do reconstruction yet
@@ -248,8 +287,14 @@ where
     let num_heard_from = sharing.shares.len() + num_bots;
     //Make sure we have enough shares already to try and reconstrcut
     if degree + 2 * threshold < num_parties && num_heard_from > degree + 2 * threshold {
-        // TODO not this might panic
-        let max_errs = threshold - num_bots;
+        // the maximum number of errors we can correct is threshold minus the number of bots
+        // max_errs = threshold - num_bots
+        let max_errs = threshold.checked_sub(num_bots).ok_or_else(|| {
+            anyhow_error_and_warn_log(format!(
+                "Underflow in reconstruction computing max_errs:  num_bots ({num_bots}) > threshold ({threshold})"
+            ))
+        })?;
+
         let opened = sharing.err_reconstruct(degree, max_errs)?;
         return Ok(Some(opened));
     }
@@ -290,7 +335,12 @@ where
     let num_heard_from = sharing.shares.len() + num_bots;
     if degree + 3 * threshold < num_parties {
         if num_heard_from > degree + 2 * threshold {
-            let max_errs = threshold - num_bots;
+            // max_errs = threshold - num_bots
+            let max_errs = threshold.checked_sub(num_bots).ok_or_else(|| {
+                anyhow_error_and_warn_log(format!(
+                "Underflow in reconstruction computing max_errs:  num_bots ({num_bots}) > threshold ({threshold})"
+            ))
+            })?;
             let opened = sharing.err_reconstruct(degree, max_errs)?;
             Ok(Some(opened))
         } else {
@@ -311,7 +361,7 @@ where
                     for share in sharing.shares.iter() {
                         if share.value()
                             == opened_poly
-                                .eval(&Z::embed_exceptional_set(share.owner().one_based())?)
+                                .eval(&Z::embed_role_to_exceptional_sequence(&share.owner())?)
                         {
                             num_shares_on_poly += 1;
                         }
@@ -342,9 +392,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::algebra::galois_rings::{
-        common::{pack_residue_poly, TryFromWrapper},
-        degree_4::ResiduePolyF4,
+    use crate::{
+        algebra::galois_rings::{
+            common::{pack_residue_poly, TryFromWrapper},
+            degree_4::ResiduePolyF4,
+        },
+        tests::randomness_check::execute_all_randomness_tests_tight,
     };
     use aes_prng::AesRng;
     use num_traits::FromPrimitive;
@@ -578,12 +631,9 @@ mod tests {
         for (i, share) in packed_shares.into_iter().enumerate() {
             if add_error && i < threshold {
                 packed_sharmir_shares
-                    .add_share(Share::new(Role::indexed_by_zero(i), share[0] + Z::ONE))
-                    .unwrap();
+                    .add_share(Share::new(Role::indexed_from_zero(i), share[0] + Z::ONE));
             } else {
-                packed_sharmir_shares
-                    .add_share(Share::new(Role::indexed_by_zero(i), share[0]))
-                    .unwrap();
+                packed_sharmir_shares.add_share(Share::new(Role::indexed_from_zero(i), share[0]));
             }
         }
 
@@ -593,5 +643,44 @@ mod tests {
                 .unwrap();
         assert_eq!(opened.at(0), secret1.at(0));
         assert_eq!(opened.at(1), secret2.at(0));
+    }
+
+    #[test]
+    fn test_share_randomness() {
+        let mut rng = AesRng::seed_from_u64(0);
+        const SHARE_COUNT: usize = 500usize;
+        const BUF_LEN: usize = 16 * 4;
+        const TRIES: usize = 10;
+
+        for _ in 0..TRIES {
+            for (num_parties, threshold) in [(4, 1), (10, 4)] {
+                let mut all_shares: Vec<Vec<ResiduePolyF4<Z128>>> = vec![vec![]; num_parties];
+                for _ in 0..SHARE_COUNT {
+                    let secret = ResiduePolyF4::<Z128>::from_scalar(Wrapping(32));
+                    let sharings = ShamirSharings::<ResiduePolyF4<Z128>>::share(
+                        &mut rng,
+                        secret,
+                        num_parties,
+                        threshold,
+                    )
+                    .unwrap();
+
+                    for (share, all_share) in
+                        sharings.shares.into_iter().zip_eq(all_shares.iter_mut())
+                    {
+                        let share_buf_bincode = bc2wrap::serialize(&share.value()).unwrap();
+                        let share_buf = share.value().to_byte_vec();
+                        assert_eq!(share_buf_bincode, share_buf);
+                        assert_eq!(share_buf.len(), BUF_LEN);
+                        all_share.push(share.value());
+                    }
+                }
+
+                for share in all_shares {
+                    assert_eq!(share.len(), SHARE_COUNT);
+                    execute_all_randomness_tests_tight(&share).unwrap();
+                }
+            }
+        }
     }
 }

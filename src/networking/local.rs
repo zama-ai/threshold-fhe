@@ -1,19 +1,20 @@
 use crate::error::error_handler::anyhow_error_and_log;
 
-use super::constants::NETWORK_TIMEOUT;
 use super::*;
-use constants::NETWORK_TIMEOUT_ASYNC;
-use constants::NETWORK_TIMEOUT_BK;
-use constants::NETWORK_TIMEOUT_BK_SNS;
+use constants::{
+    NETWORK_TIMEOUT, NETWORK_TIMEOUT_ASYNC, NETWORK_TIMEOUT_BK, NETWORK_TIMEOUT_BK_SNS,
+};
+
 use dashmap::DashMap;
+use futures_util::future::{join, join4};
 use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    Mutex,
+};
 use tokio::time::Duration;
 
 /// A simple implementation of networking for local execution.
@@ -22,22 +23,22 @@ use tokio::time::Duration;
 /// only. It simply stores all values in a hashmap without any actual networking.
 //This is using mutexes for everything round related to be able to
 //mutate state without needing self to be mutable in functions' signature
-pub struct LocalNetworking {
+pub struct LocalNetworking<R: RoleTrait> {
     current_network_timeout: Mutex<Duration>,
     next_network_timeout: Mutex<Duration>,
     max_elapsed_time: Mutex<Duration>,
-    pairwise_channels: SimulatedPairwiseChannels,
-    pub owner: Identity,
-    pub send_counter: DashMap<Identity, usize>,
+    pairwise_channels: SimulatedPairwiseChannels<R>,
+    pub owner: R,
+    pub send_counter: DashMap<R, usize>,
     pub network_round: Arc<Mutex<usize>>,
-    already_sent: Arc<Mutex<HashSet<(Identity, usize)>>>,
+    already_sent: Arc<Mutex<HashSet<(R, usize)>>>,
     pub init_time: OnceLock<Instant>,
     network_mode: NetworkMode,
     //If set, the party will sleep for the given duration at the start of each round
     delayed_party: Option<Duration>,
 }
 
-impl Default for LocalNetworking {
+impl<R: RoleTrait> Default for LocalNetworking<R> {
     fn default() -> Self {
         Self {
             current_network_timeout: Mutex::new(*NETWORK_TIMEOUT),
@@ -56,19 +57,19 @@ impl Default for LocalNetworking {
 }
 
 #[derive(Default)]
-pub struct LocalNetworkingProducer {
-    pairwise_channels: SimulatedPairwiseChannels,
+pub struct LocalNetworkingProducer<R: RoleTrait> {
+    pairwise_channels: SimulatedPairwiseChannels<R>,
 }
 
-impl LocalNetworkingProducer {
-    pub fn from_ids(identities: &[Identity]) -> Self {
+impl<R: RoleTrait> LocalNetworkingProducer<R> {
+    pub fn from_roles(roles: &HashSet<R>) -> Self {
         let pairwise_channels = DashMap::new();
-        for v1 in identities.to_owned().iter() {
-            for v2 in identities.to_owned().iter() {
-                if v1 != v2 {
+        for v1 in roles {
+            for v2 in roles {
+                if *v1 != *v2 {
                     let (tx, rx) = unbounded_channel::<LocalTaggedValue>();
                     pairwise_channels.insert(
-                        (v1.clone(), v2.clone()),
+                        (*v1, *v2),
                         (Arc::new(tx), Arc::new(tokio::sync::Mutex::new(rx))),
                     );
                 }
@@ -80,10 +81,10 @@ impl LocalNetworkingProducer {
     }
     pub fn user_net(
         &self,
-        owner: Identity,
+        owner: R,
         network_mode: NetworkMode,
         delayed_party: Option<Duration>,
-    ) -> LocalNetworking {
+    ) -> LocalNetworking<R> {
         // Async network means a timeout of 1 year
         let timeout = match network_mode {
             NetworkMode::Sync => *NETWORK_TIMEOUT,
@@ -102,37 +103,9 @@ impl LocalNetworkingProducer {
     }
 }
 
-impl LocalNetworking {
-    pub fn from_identity(owner: Identity) -> Self {
-        LocalNetworking {
-            owner,
-            ..Default::default()
-        }
-    }
-    pub fn from_ids(owner: Identity, identities: &[Identity]) -> Self {
-        let pairwise_channels = DashMap::new();
-        for v1 in identities.to_owned().iter() {
-            for v2 in identities.to_owned().iter() {
-                if v1 != v2 {
-                    let (tx, rx) = unbounded_channel::<LocalTaggedValue>();
-                    pairwise_channels.insert(
-                        (v1.clone(), v2.clone()),
-                        (Arc::new(tx), Arc::new(tokio::sync::Mutex::new(rx))),
-                    );
-                }
-            }
-        }
-        LocalNetworking {
-            pairwise_channels: Arc::new(pairwise_channels),
-            owner,
-            ..Default::default()
-        }
-    }
-}
-
-type SimulatedPairwiseChannels = Arc<
+type SimulatedPairwiseChannels<R> = Arc<
     DashMap<
-        (Identity, Identity),
+        (R, R),
         (
             Arc<UnboundedSender<LocalTaggedValue>>,
             Arc<tokio::sync::Mutex<UnboundedReceiver<LocalTaggedValue>>>,
@@ -141,59 +114,44 @@ type SimulatedPairwiseChannels = Arc<
 >;
 
 #[async_trait]
-impl Networking for LocalNetworking {
-    async fn send(&self, val: Vec<u8>, receiver: &Identity) -> anyhow::Result<(), anyhow::Error> {
+impl<R: RoleTrait> Networking<R> for LocalNetworking<R> {
+    async fn send(&self, val: Arc<Vec<u8>>, receiver: &R) -> anyhow::Result<(), anyhow::Error> {
         let (tx, _) = self
             .pairwise_channels
-            .get(&(self.owner.clone(), receiver.clone()))
+            .get(&(self.owner, *receiver))
             .ok_or_else(|| {
                 anyhow_error_and_log(format!(
-                "Could not retrieve pairwise channels in receive call, owner: {:?}, receiver: {:?}.",
+                "Could not retrieve pairwise channels in send call, owner: {:?}, receiver: {:?}.",
                 self.owner, receiver
             ))
             })?
             .value()
             .clone();
 
-        let net_round = {
-            match self.network_round.lock() {
-                Ok(net_round) => *net_round,
-                _ => panic!(
-                    "Another user of the {:?} mutex panicked",
-                    self.network_round
-                ),
-            }
-        };
+        let net_round = self.network_round.lock().await;
 
         let tagged_value = LocalTaggedValue {
-            send_counter: net_round,
-            value: val,
+            send_counter: *net_round,
+            value: val.as_ref().clone(),
         };
 
-        match self.already_sent.lock() {
-            Ok(mut already_sent) => {
-                if already_sent.contains(&(receiver.clone(), net_round)) {
-                    panic!(
-                        "Trying to send to {} in round {} more than once !",
-                        receiver, net_round
-                    )
-                } else {
-                    already_sent.insert((receiver.clone(), net_round));
-                }
-            }
-            _ => panic!(
-                "Another user of the {:?} mutex panicked.",
-                self.already_sent
-            ),
+        let mut already_sent = self.already_sent.lock().await;
+
+        if already_sent.contains(&(*receiver, *net_round)) {
+            return Err(anyhow::anyhow!(
+                "Trying to send to {receiver} in round {net_round} more than once !"
+            ));
+        } else {
+            already_sent.insert((*receiver, *net_round));
         }
 
         tx.send(tagged_value).map_err(|e| e.into())
     }
 
-    async fn receive(&self, sender: &Identity) -> anyhow::Result<Vec<u8>> {
+    async fn receive(&self, sender: &R) -> anyhow::Result<Vec<u8>> {
         let (_, rx) = self
             .pairwise_channels
-            .get(&(sender.clone(), self.owner.clone()))
+            .get(&(*sender, self.owner))
             .ok_or_else(|| {
                 anyhow_error_and_log(format!(
                 "Could not retrieve pairwise channels in receive call, owner: {:?}, sender: {:?}",
@@ -209,10 +167,7 @@ impl Networking for LocalNetworking {
             .await
             .ok_or_else(|| anyhow_error_and_log("Trying to receive from a closed channel"))?;
 
-        let network_round: usize = *self
-            .network_round
-            .lock()
-            .map_err(|e| anyhow_error_and_log(format!("Locking error: {:?}", e)))?;
+        let network_round: usize = *self.network_round.lock().await;
 
         while tagged_value.send_counter < network_round {
             tracing::debug!(
@@ -230,73 +185,57 @@ impl Networking for LocalNetworking {
         Ok(tagged_value.value)
     }
 
-    fn increase_round_counter(&self) -> anyhow::Result<()> {
+    async fn increase_round_counter(&self) {
         if let Some(duration) = self.delayed_party {
             std::thread::sleep(duration);
         }
         //Locking all mutexes in same place
         //Update max_elapsed_time
-        if let (
-            Ok(mut max_elapsed_time),
-            Ok(mut current_round_timeout),
-            Ok(next_round_timeout),
-            Ok(mut net_round),
-        ) = (
-            self.max_elapsed_time.lock(),
-            self.current_network_timeout.lock(),
-            self.next_network_timeout.lock(),
-            self.network_round.lock(),
-        ) {
-            *max_elapsed_time += *current_round_timeout;
+        let (mut max_elapsed_time, mut current_round_timeout, next_round_timeout, mut net_round) =
+            join4(
+                self.max_elapsed_time.lock(),
+                self.current_network_timeout.lock(),
+                self.next_network_timeout.lock(),
+                self.network_round.lock(),
+            )
+            .await;
+        *max_elapsed_time += *current_round_timeout;
 
-            //Update next round timeout
-            *current_round_timeout = *next_round_timeout;
+        //Update next round timeout
+        *current_round_timeout = *next_round_timeout;
 
-            //Update round counter
-            *net_round += 1;
-            tracing::debug!(
-                "changed network round to: {:?} on party: {:?}, with timeout: {:?}",
-                *net_round,
-                self.owner,
-                *current_round_timeout
-            );
-        } else {
-            return Err(anyhow_error_and_log("Couldn't lock mutex"));
-        }
-        Ok(())
+        //Update round counter
+        *net_round += 1;
+        tracing::debug!(
+            "changed network round to: {:?} on party: {:?}, with timeout: {:?}",
+            *net_round,
+            self.owner,
+            *current_round_timeout
+        )
     }
 
-    fn get_timeout_current_round(&self) -> anyhow::Result<Instant> {
+    async fn get_timeout_current_round(&self) -> Instant {
         // initialize init_time on first access
         // this avoids running into timeouts when large computations happen after the test runtime is set up and before the first message is received.
         let init_time = self.init_time.get_or_init(Instant::now);
 
-        if let (Ok(max_elapsed_time), Ok(network_timeout)) = (
+        let (max_elapsed_time, network_timeout) = join(
             self.max_elapsed_time.lock(),
             self.current_network_timeout.lock(),
-        ) {
-            Ok(*init_time + *network_timeout + *max_elapsed_time)
-        } else {
-            Err(anyhow_error_and_log("Couldn't lock mutex"))
-        }
+        )
+        .await;
+        *init_time + *network_timeout + *max_elapsed_time
     }
 
-    fn get_current_round(&self) -> anyhow::Result<usize> {
-        if let Ok(net_round) = self.network_round.lock() {
-            Ok(*net_round)
-        } else {
-            Err(anyhow_error_and_log("Couldn't lock network round mutex"))
-        }
+    async fn get_current_round(&self) -> usize {
+        *self.network_round.lock().await
     }
 
-    fn set_timeout_for_next_round(&self, timeout: Duration) -> anyhow::Result<()> {
+    async fn set_timeout_for_next_round(&self, timeout: Duration) {
         match self.get_network_mode() {
             NetworkMode::Sync => {
-                if let Ok(mut next_network_timeout) = self.next_network_timeout.lock() {
-                    *next_network_timeout = timeout;
-                } else {
-                    return Err(anyhow_error_and_log("Couldn't lock mutex"));
-                }
+                let mut next_network_timeout = self.next_network_timeout.lock().await;
+                *next_network_timeout = timeout;
             }
             NetworkMode::Async => {
                 tracing::warn!(
@@ -304,15 +243,15 @@ impl Networking for LocalNetworking {
                 );
             }
         }
-        Ok(())
     }
 
-    fn set_timeout_for_bk(&self) -> anyhow::Result<()> {
-        self.set_timeout_for_next_round(*NETWORK_TIMEOUT_BK)
+    async fn set_timeout_for_bk(&self) {
+        self.set_timeout_for_next_round(*NETWORK_TIMEOUT_BK).await
     }
 
-    fn set_timeout_for_bk_sns(&self) -> anyhow::Result<()> {
+    async fn set_timeout_for_bk_sns(&self) {
         self.set_timeout_for_next_round(*NETWORK_TIMEOUT_BK_SNS)
+            .await
     }
 
     fn get_network_mode(&self) -> NetworkMode {
@@ -320,12 +259,12 @@ impl Networking for LocalNetworking {
     }
 
     #[cfg(feature = "choreographer")]
-    fn get_num_byte_sent(&self) -> anyhow::Result<usize> {
-        Ok(0)
+    async fn get_num_byte_sent(&self) -> usize {
+        0
     }
 
     #[cfg(feature = "choreographer")]
-    fn get_num_byte_received(&self) -> anyhow::Result<usize> {
+    async fn get_num_byte_received(&self) -> anyhow::Result<usize> {
         Ok(0)
     }
 }
@@ -339,47 +278,107 @@ struct LocalTaggedValue {
 #[cfg(test)]
 mod tests {
 
-    use crate::networking::value::NetworkValue;
+    use crate::{
+        execution::runtime::{
+            party::{Role, TwoSetsRole},
+            sessions::session_parameters::DeSerializationRunTime,
+        },
+        networking::value::NetworkValue,
+    };
 
     use super::*;
     use std::num::Wrapping;
 
     #[tokio::test]
     async fn test_sync_networking() {
-        let identities: Vec<Identity> = vec!["alice".into(), "bob".into()];
-        let net_producer = LocalNetworkingProducer::from_ids(&identities);
+        let alice = Role::indexed_from_one(1);
+        let bob = Role::indexed_from_one(2);
+        let roles = HashSet::from([alice, bob]);
+        let net_producer = LocalNetworkingProducer::from_roles(&roles);
 
-        let net_alice = net_producer.user_net("alice".into(), NetworkMode::Sync, None);
-        let net_bob = net_producer.user_net("bob".into(), NetworkMode::Sync, None);
+        let net_alice = net_producer.user_net(alice, NetworkMode::Sync, None);
+        let net_bob = net_producer.user_net(bob, NetworkMode::Sync, None);
 
         let task1 = tokio::spawn(async move {
-            let recv = net_bob.receive(&"alice".into()).await;
+            let recv = net_bob.receive(&alice).await;
             assert_eq!(
-                bincode::serialize(&NetworkValue::<Wrapping::<u64>>::from_network(recv).unwrap())
-                    .unwrap(),
-                bincode::serialize(&NetworkValue::RingValue(Wrapping::<u64>(1234))).unwrap()
+                bc2wrap::serialize(
+                    &NetworkValue::<Wrapping::<u64>>::from_network(
+                        recv,
+                        DeSerializationRunTime::Tokio
+                    )
+                    .await
+                    .unwrap()
+                )
+                .unwrap(),
+                bc2wrap::serialize(&NetworkValue::RingValue(Wrapping::<u64>(1234))).unwrap()
             );
         });
 
         let task2 = tokio::spawn(async move {
             let value = NetworkValue::RingValue(Wrapping::<u64>(1234));
-            net_alice.send(value.to_network(), &"bob".into()).await
+            net_alice.send(Arc::new(value.to_network()), &bob).await
         });
 
         let _ = tokio::try_join!(task1, task2).unwrap();
     }
+
     #[tokio::test]
-    #[should_panic = "Trying to send to bob in round 0 more than once !"]
-    async fn test_sync_networking_panic() {
-        let identities: Vec<Identity> = vec!["alice".into(), "bob".into()];
-        let net_producer = LocalNetworkingProducer::from_ids(&identities);
+    async fn test_networking_two_sets() {
+        let role_1_set_1 = TwoSetsRole::Set1(Role::indexed_from_one(1));
+        let role_1_set_2 = TwoSetsRole::Set2(Role::indexed_from_one(1));
 
-        let net_alice = net_producer.user_net("alice".into(), NetworkMode::Sync, None);
+        let roles = HashSet::from([role_1_set_1, role_1_set_2]);
+        let net_producer = LocalNetworkingProducer::from_roles(&roles);
 
-        let value = NetworkValue::RingValue(Wrapping::<u64>(1234));
-        let _ = net_alice
-            .send(value.clone().to_network(), &"bob".into())
-            .await;
-        let _ = net_alice.send(value.to_network(), &"bob".into()).await;
+        let net_party_1_set_1 = net_producer.user_net(role_1_set_1, NetworkMode::Sync, None);
+        let net_party_1_set_2 = net_producer.user_net(role_1_set_2, NetworkMode::Sync, None);
+
+        let task1 = tokio::spawn(async move {
+            let recv = net_party_1_set_1.receive(&role_1_set_2).await;
+            assert_eq!(
+                bc2wrap::serialize(
+                    &NetworkValue::<Wrapping::<u64>>::from_network(
+                        recv,
+                        DeSerializationRunTime::Tokio
+                    )
+                    .await
+                    .unwrap()
+                )
+                .unwrap(),
+                bc2wrap::serialize(&NetworkValue::RingValue(Wrapping::<u64>(1234))).unwrap()
+            );
+        });
+
+        let task2 = tokio::spawn(async move {
+            let value = NetworkValue::RingValue(Wrapping::<u64>(1234));
+            net_party_1_set_2
+                .send(Arc::new(value.to_network()), &role_1_set_1)
+                .await
+        });
+
+        let _ = tokio::try_join!(task1, task2).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_networking_duplicate_send_error() {
+        let alice = Role::indexed_from_one(1);
+        let bob = Role::indexed_from_one(2);
+        let roles = HashSet::from([alice, bob]);
+        let net_producer = LocalNetworkingProducer::from_roles(&roles);
+
+        let net_alice = net_producer.user_net(alice, NetworkMode::Sync, None);
+
+        let value = Arc::new(NetworkValue::RingValue(Wrapping::<u64>(1234)).to_network());
+        // First send should succeed
+        let result1 = net_alice.send(value.clone(), &bob).await;
+        assert!(result1.is_ok());
+
+        // Second send to same receiver in same round should fail
+        let result2 = net_alice.send(value.clone(), &bob).await;
+        assert!(result2.is_err());
+        let error_msg = result2.unwrap_err().to_string();
+        assert!(error_msg
+            .contains(&format!("Trying to send to {bob} in round 0 more than once !").to_string()));
     }
 }

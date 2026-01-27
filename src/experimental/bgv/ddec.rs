@@ -8,6 +8,7 @@ use crate::algebra::poly::Poly;
 use crate::algebra::structure_traits::ZConsts;
 use crate::algebra::structure_traits::{One, Zero};
 use crate::execution::runtime::party::Role;
+use crate::execution::small_execution::prss::PRSSPrimitives;
 use crate::experimental::algebra::cyclotomic::TernaryEntry;
 use crate::experimental::algebra::integers::ZeroCenteredRem;
 use crate::experimental::bgv::basics::SecretKey;
@@ -21,7 +22,8 @@ use crate::experimental::{
 use crate::{
     algebra::structure_traits::FromU128,
     execution::{
-        online::triple::open_list, runtime::session::SmallSessionHandles, sharing::share::Share,
+        online::triple::open_list, runtime::sessions::small_session::SmallSessionHandles,
+        sharing::share::Share,
     },
     experimental::{
         algebra::integers::IntQ,
@@ -57,17 +59,16 @@ fn partial_decrypt<N: Const + NTTConstants<LevelOne>>(
         .collect_vec()
 }
 // run decryption with noise flooding
-#[instrument(name = "BGV.Threshold-Dec", skip_all,fields(sid = ?session.session_id(), own_identity = ?session.own_identity()))]
+#[instrument(name = "BGV.Threshold-Dec", skip_all,fields(sid = ?session.session_id(), my_role = ?session.my_role()))]
 pub(crate) async fn noise_flood_decryption<
     N: Clone + Const + NTTConstants<LevelOne>,
-    R: Rng + CryptoRng,
-    S: SmallSessionHandles<LevelOne, R>,
+    S: SmallSessionHandles<LevelOne>,
 >(
     session: &mut S,
     keyshares: &PrivateBgvKeySet,
     ciphertext: &LevelledCiphertext<LevelEll, N>,
 ) -> anyhow::Result<Vec<u32>> {
-    let own_role = session.my_role()?;
+    let own_role = session.my_role();
     let prss_state = session.prss_as_mut();
 
     let q = LevelOne {
@@ -84,16 +85,25 @@ pub(crate) async fn noise_flood_decryption<
 
     let dist_shift = LevelOne::from_u128(PLAINTEXT_MODULUS.get().into());
     //NOTE: We assumed a power of two cyclotomic ring, so E_M = 1 (Design Decision 24)
-    let shifted_t_vec = (0..N::VALUE)
-        .map(|_| prss_state.mask_next(own_role, 1u128 << ((LOG_B_MULT - LOG_PLAINTEXT) as u128)))
-        .try_collect::<_, Vec<LevelOne>, _>()?
+    let shifted_t_vec = prss_state
+        .mask_next_vec(
+            own_role,
+            1u128 << ((LOG_B_MULT - LOG_PLAINTEXT) as u128),
+            N::VALUE,
+        )
+        .await?
         .into_iter()
         .map(|x| x * dist_shift)
         .collect_vec();
 
+    if p_share.len() != shifted_t_vec.len() {
+        return Err(anyhow::anyhow!(
+            "Partial decryption shares and masks do not match in length"
+        ));
+    }
     let c_vec = p_share
         .into_iter()
-        .zip(shifted_t_vec)
+        .zip_eq(shifted_t_vec)
         .map(|(p_entry, shifted_t_entry)| p_entry + shifted_t_entry)
         .collect_vec();
     let partial_decrypted = open_list(&c_vec, session).await?;
@@ -137,7 +147,7 @@ pub fn keygen_shares<R: Rng + CryptoRng>(
         let mut field_index = LevelOne::ONE;
         for (party_id, shares_per_party) in all_shares.iter_mut().enumerate() {
             shares_per_party.sk.push(Share::new(
-                Role::indexed_by_zero(party_id),
+                Role::indexed_from_zero(party_id),
                 poly.eval(&field_index),
             ));
             field_index += LevelOne::ONE;
@@ -154,8 +164,8 @@ mod tests {
     use crate::algebra::structure_traits::Ring;
     use crate::algebra::structure_traits::ZConsts;
     use crate::algebra::structure_traits::Zero;
-    use crate::execution::runtime::session::ParameterHandles;
-    use crate::execution::runtime::test_runtime::generate_fixed_identities;
+    use crate::execution::runtime::sessions::session_parameters::GenericParameterHandles;
+    use crate::execution::runtime::test_runtime::generate_fixed_roles;
     use crate::execution::runtime::test_runtime::DistributedTestRuntime;
     use crate::execution::sharing::shamir::RevealOp;
     use crate::execution::sharing::shamir::ShamirSharings;
@@ -232,36 +242,39 @@ mod tests {
                 .collect_vec(),
         );
 
-        let identities = generate_fixed_identities(num_parties);
+        let roles = generate_fixed_roles(num_parties);
         //This is Async because we only do DDec, which is "online only"
         //Delay P1 by 1s every round
         let delay_map = HashMap::from([(
-            identities.first().unwrap().clone(),
+            *roles.get(&Role::indexed_from_one(1)).unwrap(),
             tokio::time::Duration::from_secs(1),
         )]);
-        let runtime: DistributedTestRuntime<LevelOne, { LevelOne::EXTENSION_DEGREE }> =
-            DistributedTestRuntime::new(identities, threshold, NetworkMode::Async, Some(delay_map));
+        let runtime: DistributedTestRuntime<LevelOne, Role, { LevelOne::EXTENSION_DEGREE }> =
+            DistributedTestRuntime::new(roles, threshold, NetworkMode::Async, Some(delay_map));
 
-        let session_id = SessionId(1);
+        let session_id = SessionId::from(1);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let mut set = JoinSet::new();
-        for (index_id, _identity) in runtime.identities.clone().into_iter().enumerate() {
-            let mut session = runtime.small_session_for_party(session_id, index_id, None);
+        for role in &runtime.roles {
+            let mut session = rt.block_on(async {
+                runtime
+                    .small_session_for_party(session_id, *role, None)
+                    .await
+            });
 
             let ksc = Arc::clone(&ntt_keyshares);
             let ctc = Arc::clone(&ct);
 
-            let own_role = Role::indexed_by_zero(index_id);
-            let ntt_shares = ksc.as_ref()[index_id]
+            let ntt_shares = ksc.as_ref()[role.one_based() - 1]
                 .iter()
-                .map(|ntt_val| Share::new(own_role, *ntt_val))
+                .map(|ntt_val| Share::new(*role, *ntt_val))
                 .collect_vec();
             let private_keyset = Arc::new(PrivateBgvKeySet::from_eval_domain(ntt_shares));
 
             set.spawn(async move {
-                let my_role = session.my_role().unwrap();
+                let my_role = session.my_role();
                 let m = noise_flood_decryption(&mut session, private_keyset.as_ref(), ctc.as_ref())
                     .await
                     .unwrap();

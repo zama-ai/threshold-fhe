@@ -9,14 +9,13 @@ use crate::{
     algebra::structure_traits::FromU128,
     execution::{
         online::triple::{mult_list, open_list},
-        runtime::{party::Role, session::BaseSessionHandles},
+        runtime::{party::Role, sessions::base_session::BaseSessionHandles},
         sharing::share::Share,
     },
 };
 use crypto_bigint::{NonZero, U1536};
 use itertools::Itertools;
-use rand::{CryptoRng, Rng};
-use std::ops::Mul;
+use std::{ops::Mul, sync::Arc};
 use tracing::instrument;
 
 #[derive(Clone)]
@@ -40,13 +39,8 @@ impl BGVShareSecretKey {
     }
 }
 
-#[instrument(name="BGV.Threshold-KeyGen",skip_all, fields(sid = ?session.session_id(), own_identity = ?session.own_identity()))]
-pub async fn bgv_distributed_keygen<
-    N,
-    R: Rng + CryptoRng,
-    S: BaseSessionHandles<R>,
-    P: BGVDkgPreprocessing,
->(
+#[instrument(name="BGV.Threshold-KeyGen",skip_all, fields(sid = ?session.session_id(), my_role = ?session.my_role()))]
+pub async fn bgv_distributed_keygen<N, S: BaseSessionHandles, P: BGVDkgPreprocessing>(
     session: &mut S,
     preprocessing: &mut P,
     plaintext_mod: u64,
@@ -56,7 +50,7 @@ where
     RqElement<LevelKsw, N>: Mul<RqElement<LevelKsw, N>, Output = RqElement<LevelKsw, N>>,
     for<'r> RqElement<LevelKsw, N>: Mul<&'r LevelKsw, Output = RqElement<LevelKsw, N>>,
 {
-    let own_role = session.my_role()?;
+    let own_role = session.my_role();
     let p = LevelKsw::from_u128(plaintext_mod as u128);
     //Sample secret key share
     let sk_share = preprocessing.next_ternary_vec(N::VALUE)?;
@@ -102,13 +96,21 @@ where
     let e_pk_prime_times_p = e_pk_prime.iter().map(|x| x * p).collect_vec();
 
     //Compute sk odot sk in the polynomial ring via NTT
-    let sk_share_ntt = sk_ntt
-        .into_iter()
-        .map(|val| Share::new(own_role, val))
-        .collect_vec();
+    let sk_share_ntt = Arc::new(
+        sk_ntt
+            .into_iter()
+            .map(|val| Share::new(own_role, val))
+            .collect_vec(),
+    );
 
     let triples = preprocessing.next_triple_vec(N::VALUE)?;
-    let sk_odot_sk_ntt_share = mult_list(&sk_share_ntt, &sk_share_ntt, triples, session).await?;
+    let sk_odot_sk_ntt_share = mult_list(
+        Arc::clone(&sk_share_ntt),
+        Arc::clone(&sk_share_ntt),
+        triples,
+        session,
+    )
+    .await?;
     let mut sk_odot_sk = sk_odot_sk_ntt_share
         .iter()
         .map(|share| share.value())
@@ -122,10 +124,16 @@ where
 
     //Continue computing pk_b_prime now that we have sk \odot sk
     ntt_inv::<_, N>(&mut pk_b_prime, N::VALUE);
+    if pk_b_prime.len() != e_pk_prime_times_p.len() || pk_b_prime.len() != sk_odot_sk_times_r.len()
+    {
+        return Err(anyhow::anyhow!(
+            "Public key vectors must have the same length"
+        ));
+    }
     let pk_b_prime = pk_b_prime
         .into_iter()
-        .zip(e_pk_prime_times_p)
-        .zip(sk_odot_sk_times_r)
+        .zip_eq(e_pk_prime_times_p)
+        .zip_eq(sk_odot_sk_times_r)
         .map(|((x, y), z)| y + x - z)
         .collect_vec();
 
@@ -188,7 +196,9 @@ mod tests {
         algebra::structure_traits::{One, Ring, ZConsts, Zero},
         execution::{
             online::{preprocessing::dummy::DummyPreprocessing, triple::open_list},
-            runtime::session::{BaseSessionHandles, SmallSession},
+            runtime::sessions::{
+                base_session::GenericBaseSessionHandles, small_session::SmallSession,
+            },
         },
         experimental::{
             algebra::{
@@ -245,17 +255,14 @@ mod tests {
         assert_eq!(plaintext, plaintext_vec);
     }
 
-    #[test]
-    fn test_dkg_dummy_preproc() {
+    #[tokio::test]
+    async fn test_dkg_dummy_preproc() {
         let parties = 5;
         let threshold = 1;
         let mut task = |mut session: SmallSession<LevelKsw>, _bot: Option<String>| async move {
-            let mut prep = DummyPreprocessing::<LevelKsw, AesRng, SmallSession<LevelKsw>>::new(
-                0,
-                session.clone(),
-            );
+            let mut prep = DummyPreprocessing::<LevelKsw>::new(0, &session);
 
-            let (pk, sk) = bgv_distributed_keygen::<N65536, _, _, _>(
+            let (pk, sk) = bgv_distributed_keygen::<N65536, _, _>(
                 &mut session,
                 &mut prep,
                 PLAINTEXT_MODULUS.get().0,
@@ -279,25 +286,22 @@ mod tests {
             Some(delay_vec),
             &mut task,
             None,
-        );
+        )
+        .await;
         test_dkg(&mut results, PLAINTEXT_MODULUS.get().0);
     }
 
-    #[test]
-    fn test_dkg_with_offline() {
+    #[tokio::test]
+    async fn test_dkg_with_offline() {
         let parties = 5;
         let threshold = 1;
         let mut task = |mut session: SmallSession<LevelKsw>, _bot: Option<String>| async move {
-            let mut dummy_preproc =
-                DummyPreprocessing::<LevelKsw, AesRng, SmallSession<LevelKsw>>::new(
-                    0,
-                    session.clone(),
-                );
+            let mut dummy_preproc = DummyPreprocessing::<LevelKsw>::new(0, &session);
 
             session
                 .network()
                 .set_timeout_for_next_round(Duration::from_secs(600))
-                .unwrap();
+                .await;
             let mut bgv_preproc = InMemoryBGVDkgPreprocessing::default();
             bgv_preproc
                 .fill_from_base_preproc(N65536::VALUE, &mut session, &mut dummy_preproc)
@@ -307,8 +311,8 @@ mod tests {
             session
                 .network()
                 .set_timeout_for_next_round(*NETWORK_TIMEOUT_ASYNC)
-                .unwrap();
-            let (pk, sk) = bgv_distributed_keygen::<N65536, _, _, _>(
+                .await;
+            let (pk, sk) = bgv_distributed_keygen::<N65536, _, _>(
                 &mut session,
                 &mut bgv_preproc,
                 PLAINTEXT_MODULUS.get().0,
@@ -330,7 +334,8 @@ mod tests {
             None,
             &mut task,
             None,
-        );
+        )
+        .await;
 
         test_dkg(&mut results, PLAINTEXT_MODULUS.get().0);
     }

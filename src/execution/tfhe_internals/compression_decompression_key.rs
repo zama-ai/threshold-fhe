@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tfhe::{
     boolean::prelude::{GlweDimension, PolynomialSize},
-    shortint::parameters::CompressionParameters,
+    shortint::parameters::{list_compression::ClassicCompressionParameters, CompressionParameters},
     Versionize,
 };
 use tfhe_versionable::VersionsDispatch;
@@ -9,9 +9,12 @@ use tfhe_versionable::VersionsDispatch;
 use crate::{
     algebra::{
         galois_rings::common::ResiduePoly,
-        structure_traits::{BaseRing, Ring},
+        structure_traits::{BaseRing, ErrorCorrect},
     },
-    execution::online::preprocessing::BitPreprocessing,
+    execution::{
+        online::preprocessing::BitPreprocessing,
+        runtime::sessions::base_session::BaseSessionHandles,
+    },
 };
 
 use super::{glwe_key::GlweSecretKeyShare, lwe_key::LweSecretKeyShare};
@@ -32,23 +35,28 @@ pub struct CompressionPrivateKeyShares<Z: Clone, const EXTENSION_DEGREE: usize> 
 
 impl<Z: BaseRing, const EXTENSION_DEGREE: usize> CompressionPrivateKeyShares<Z, EXTENSION_DEGREE>
 where
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    pub fn new_from_preprocessing<
+    pub async fn new_from_preprocessing<
         P: BitPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+        S: BaseSessionHandles,
     >(
-        params: CompressionParameters,
+        params: ClassicCompressionParameters,
         preprocessing: &mut P,
+        pmax: Option<f64>,
+        session: &mut S,
     ) -> anyhow::Result<Self> {
         let total_size = params.packing_ks_glwe_dimension.0 * params.packing_ks_polynomial_size.0;
-        let post_packing_ks_key = GlweSecretKeyShare::new_from_preprocessing(
-            total_size,
-            params.packing_ks_polynomial_size,
-            preprocessing,
-        )?;
         Ok(Self {
-            post_packing_ks_key,
-            params,
+            post_packing_ks_key: GlweSecretKeyShare::new_from_preprocessing(
+                total_size,
+                params.packing_ks_polynomial_size,
+                preprocessing,
+                pmax,
+                session,
+            )
+            .await?,
+            params: CompressionParameters::Classic(params),
         })
     }
 

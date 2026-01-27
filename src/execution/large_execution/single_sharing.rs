@@ -1,35 +1,33 @@
-use super::local_single_share::LocalSingleShare;
+use super::local_single_share::{LocalSingleShare, SecureLocalSingleShare};
 use crate::{
     algebra::{
         bivariate::{compute_powers, MatrixMul},
-        structure_traits::{Derive, ErrorCorrect, Invert, Ring, RingEmbed},
+        structure_traits::{Derive, ErrorCorrect, Invert, Ring, RingWithExceptionalSequence},
     },
     error::error_handler::anyhow_error_and_log,
-    execution::runtime::{party::Role, session::LargeSessionHandles},
+    execution::runtime::{party::Role, sessions::large_session::LargeSessionHandles},
+    ProtocolDescription,
 };
 use async_trait::async_trait;
 use itertools::Itertools;
 use ndarray::{ArrayD, IxDyn};
-use rand::{CryptoRng, Rng};
 use std::collections::HashMap;
 use tracing::instrument;
 
+pub type SecureSingleSharing<Z> = RealSingleSharing<Z, SecureLocalSingleShare>;
+
 #[async_trait]
-pub trait SingleSharing<Z: Ring>: Send + Sync + Default + Clone {
-    async fn init<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
+pub trait SingleSharing<Z: Ring>: ProtocolDescription + Send + Sync + Clone {
+    async fn init<L: LargeSessionHandles>(
         &mut self,
         session: &mut L,
         l: usize,
     ) -> anyhow::Result<()>;
-    async fn next<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
-        &mut self,
-        session: &mut L,
-    ) -> anyhow::Result<Z>;
+    async fn next<L: LargeSessionHandles>(&mut self, session: &mut L) -> anyhow::Result<Z>;
 }
 
 //Might want to store the dispute set at the output of the lsl call
 //as that'll influence how to reconstruct stuff later on
-#[derive(Clone, Default)]
 pub struct RealSingleSharing<Z, S: LocalSingleShare> {
     local_single_share: S,
     available_lsl: Vec<ArrayD<Z>>,
@@ -38,12 +36,50 @@ pub struct RealSingleSharing<Z, S: LocalSingleShare> {
     vdm_matrix: ArrayD<Z>,
 }
 
+impl<Z, S: LocalSingleShare> ProtocolDescription for RealSingleSharing<Z, S> {
+    fn protocol_desc(depth: usize) -> String {
+        let indent = Self::INDENT_STRING.repeat(depth);
+        format!(
+            "{}-RealSingleSharing:\n{}",
+            indent,
+            S::protocol_desc(depth + 1)
+        )
+    }
+}
+
+//Custom implementaiton of Clone to make sure we do not clone
+//the internal state as that would be insecure.
+//What we may want is to clone the underlying strategy
+impl<Z: Default, S: LocalSingleShare> Clone for RealSingleSharing<Z, S> {
+    fn clone(&self) -> Self {
+        Self::new(self.local_single_share.clone())
+    }
+}
+
+impl<Z: Default, S: LocalSingleShare> RealSingleSharing<Z, S> {
+    pub fn new(local_single_share: S) -> Self {
+        Self {
+            local_single_share,
+            available_lsl: Vec::default(),
+            available_shares: Vec::default(),
+            max_num_iterations: usize::default(),
+            vdm_matrix: ArrayD::<Z>::default(IxDyn::default()),
+        }
+    }
+}
+
+impl<Z: Default, S: LocalSingleShare + Default> Default for RealSingleSharing<Z, S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
 #[async_trait]
-impl<Z: Ring + RingEmbed + Invert + Derive + ErrorCorrect, S: LocalSingleShare> SingleSharing<Z>
+impl<Z: Invert + Derive + ErrorCorrect, S: LocalSingleShare> SingleSharing<Z>
     for RealSingleSharing<Z, S>
 {
-    #[instrument(name="SingleSharing.Init",skip(self,session),fields(sid = ?session.session_id(),own_identity=?session.own_identity(), batch_size = ?l))]
-    async fn init<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
+    #[instrument(name="SingleSharing.Init",skip(self,session),fields(sid = ?session.session_id(),my_role=?session.my_role(), batch_size = ?l))]
+    async fn init<L: LargeSessionHandles>(
         &mut self,
         session: &mut L,
         l: usize,
@@ -77,10 +113,7 @@ impl<Z: Ring + RingEmbed + Invert + Derive + ErrorCorrect, S: LocalSingleShare> 
     }
 
     //NOTE: This is instrumented by the caller function to use the same span for all calls
-    async fn next<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
-        &mut self,
-        session: &mut L,
-    ) -> anyhow::Result<Z> {
+    async fn next<L: LargeSessionHandles>(&mut self, session: &mut L) -> anyhow::Result<Z> {
         //If there's no shares available we recompute a new batch
         if self.available_shares.is_empty() {
             //If there's no more randomness to extract we re init
@@ -100,11 +133,14 @@ impl<Z: Ring + RingEmbed + Invert + Derive + ErrorCorrect, S: LocalSingleShare> 
 
 ///Create the VDM matrix of dimension (height, width) such that
 /// VDM_{i,j} = alpha_i^j, with alpha_i the ith element of the exceptional set
-pub fn init_vdm<Z: Ring + RingEmbed>(height: usize, width: usize) -> anyhow::Result<ArrayD<Z>> {
+pub fn init_vdm<Z: RingWithExceptionalSequence>(
+    height: usize,
+    width: usize,
+) -> anyhow::Result<ArrayD<Z>> {
     // We could actually probably take 0 in the VDM matrix, but to match the alpha indexing with the one we use for parties,
     //we skip it
     let exceptional_sequence: Vec<Z> = (0..height)
-        .map(|idx| Z::embed_exceptional_set(idx + 1))
+        .map(|idx| Z::get_from_exceptional_sequence(idx + 1))
         .try_collect()?;
 
     let powers_of_exceptional_sequence: Vec<Z> = exceptional_sequence
@@ -136,7 +172,7 @@ fn format_for_next<Z: Ring>(
         for party_idx in 0..num_parties {
             vec.push(
                 local_single_shares
-                    .get(&Role::indexed_by_zero(party_idx))
+                    .get(&Role::indexed_from_zero(party_idx))
                     .ok_or_else(|| {
                         anyhow_error_and_log(format!(
                             "Can not find shares for Party {}",
@@ -166,26 +202,20 @@ fn compute_next_batch<Z: Ring>(
 pub(crate) mod tests {
     #[cfg(feature = "extension_degree_8")]
     use super::init_vdm;
-    use super::RealSingleSharing;
     use crate::algebra::galois_rings::degree_4::{ResiduePolyF4Z128, ResiduePolyF4Z64};
     #[cfg(feature = "extension_degree_8")]
     use crate::algebra::galois_rings::degree_8::ResiduePolyF8;
     use crate::execution::large_execution::constants::DISPUTE_STAT_SEC;
-    use crate::execution::runtime::session::BaseSessionHandles;
+    use crate::execution::runtime::sessions::base_session::GenericBaseSessionHandles;
+    use crate::execution::runtime::sessions::session_parameters::GenericParameterHandles;
     use crate::execution::sharing::shamir::RevealOp;
     use crate::networking::NetworkMode;
     use crate::{
-        algebra::structure_traits::{Derive, ErrorCorrect, Invert, Ring, RingEmbed, Sample},
+        algebra::structure_traits::{Derive, ErrorCorrect, Invert, Ring, Sample},
         execution::{
-            large_execution::{
-                coinflip::RealCoinflip,
-                local_single_share::{LocalSingleShare, RealLocalSingleShare},
-                share_dispute::RealShareDispute,
-                single_sharing::SingleSharing,
-                vss::RealVss,
-            },
+            large_execution::{single_sharing::SecureSingleSharing, single_sharing::SingleSharing},
             runtime::party::Role,
-            runtime::session::{LargeSession, ParameterHandles},
+            runtime::sessions::large_session::LargeSession,
             sharing::{shamir::ShamirSharings, share::Share},
         },
         tests::helper::tests_and_benches::execute_protocol_large,
@@ -197,19 +227,8 @@ pub(crate) mod tests {
     #[cfg(feature = "extension_degree_8")]
     use std::num::Wrapping;
 
-    type TrueLocalSingleShare = RealLocalSingleShare<RealCoinflip<RealVss>, RealShareDispute>;
-
-    pub(crate) fn create_real_single_sharing<Z: Ring, L: LocalSingleShare>(
-        lsl_strategy: L,
-    ) -> RealSingleSharing<Z, L> {
-        RealSingleSharing {
-            local_single_share: lsl_strategy,
-            ..Default::default()
-        }
-    }
-
-    fn test_singlesharing<
-        Z: Ring + RingEmbed + Derive + ErrorCorrect + Invert,
+    async fn test_singlesharing<
+        Z: Derive + ErrorCorrect + Invert,
         const EXTENSION_DEGREE: usize,
     >(
         parties: usize,
@@ -220,7 +239,7 @@ pub(crate) mod tests {
             let extracted_size = session.num_parties() - session.threshold() as usize;
             let num_output = lsl_batch_size * extracted_size + 1;
             let mut res = Vec::<Z>::new();
-            let mut single_sharing = RealSingleSharing::<Z, TrueLocalSingleShare>::default();
+            let mut single_sharing = SecureSingleSharing::<Z>::default();
             single_sharing
                 .init(&mut session, lsl_batch_size)
                 .await
@@ -228,7 +247,7 @@ pub(crate) mod tests {
             for _ in 0..num_output {
                 res.push(single_sharing.next(&mut session).await.unwrap());
             }
-            (session.my_role().unwrap(), res)
+            (session.my_role(), res)
         };
 
         // Rounds (only on the happy path here)
@@ -251,7 +270,8 @@ pub(crate) mod tests {
             NetworkMode::Sync,
             None,
             &mut task,
-        );
+        )
+        .await;
 
         //Check we can reconstruct
         let lsl_batch_size = 10_usize;
@@ -272,26 +292,28 @@ pub(crate) mod tests {
     #[rstest]
     #[case(4, 1)]
     #[case(7, 2)]
-    fn test_singlesharing_z128(#[case] num_parties: usize, #[case] threshold: usize) {
+    async fn test_singlesharing_z128(#[case] num_parties: usize, #[case] threshold: usize) {
         test_singlesharing::<ResiduePolyF4Z128, { ResiduePolyF4Z128::EXTENSION_DEGREE }>(
             num_parties,
             threshold,
-        );
+        )
+        .await;
     }
 
     #[rstest]
     #[case(4, 1)]
     #[case(7, 2)]
-    fn test_singlesharing_z64(#[case] num_parties: usize, #[case] threshold: usize) {
+    async fn test_singlesharing_z64(#[case] num_parties: usize, #[case] threshold: usize) {
         test_singlesharing::<ResiduePolyF4Z64, { ResiduePolyF4Z64::EXTENSION_DEGREE }>(
             num_parties,
             threshold,
-        );
+        )
+        .await;
     }
     //P2 dropout, but gives random value for reconstruction.
     // expect to see it as corrupt but able to reconstruct
-    #[test]
-    fn test_singlesharing_dropout() {
+    #[tokio::test]
+    async fn test_singlesharing_dropout() {
         let parties = 4;
         let threshold = 1;
 
@@ -300,9 +322,8 @@ pub(crate) mod tests {
             let extracted_size = session.num_parties() - session.threshold() as usize;
             let num_output = lsl_batch_size * extracted_size + 1;
             let mut res = Vec::<ResiduePolyF4Z128>::new();
-            if session.my_role().unwrap().one_based() != 2 {
-                let mut single_sharing =
-                    RealSingleSharing::<ResiduePolyF4Z128, TrueLocalSingleShare>::default();
+            if session.my_role().one_based() != 2 {
+                let mut single_sharing = SecureSingleSharing::<ResiduePolyF4Z128>::default();
                 single_sharing
                     .init(&mut session, lsl_batch_size)
                     .await
@@ -310,13 +331,13 @@ pub(crate) mod tests {
                 for _ in 0..num_output {
                     res.push(single_sharing.next(&mut session).await.unwrap());
                 }
-                assert!(session.corrupt_roles().contains(&Role::indexed_by_one(2)));
+                assert!(session.corrupt_roles().contains(&Role::indexed_from_one(2)));
             } else {
                 for _ in 0..num_output {
                     res.push(ResiduePolyF4Z128::sample(session.rng()));
                 }
             }
-            (session.my_role().unwrap(), res)
+            (session.my_role(), res)
         }
 
         // SingleSharing assumes Sync network
@@ -325,7 +346,8 @@ pub(crate) mod tests {
             _,
             ResiduePolyF4Z128,
             { ResiduePolyF4Z128::EXTENSION_DEGREE },
-        >(parties, threshold, None, NetworkMode::Sync, None, &mut task);
+        >(parties, threshold, None, NetworkMode::Sync, None, &mut task)
+        .await;
 
         //Check we can reconstruct
         let lsl_batch_size = 10_usize;

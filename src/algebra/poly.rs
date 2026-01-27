@@ -1,16 +1,19 @@
 use super::{
     galois_rings::common::{LutMulReduction, ResiduePoly},
-    structure_traits::{Field, Invert, One, Ring, RingEmbed, Sample, Zero},
+    structure_traits::{Field, Invert, One, Ring, RingWithExceptionalSequence, Sample, Zero},
 };
 use crate::error::error_handler::anyhow_error_and_log;
+use itertools::Itertools;
 use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
 /// Generic polynomial struct
+/// Constructing the polynomial should be done using `Poly::from_coefs`
+/// since it compresses the polynomial by removing leading zeros.
 #[derive(Serialize, Deserialize, Hash, Clone, Default, Debug)]
 pub struct Poly<F> {
-    pub coefs: Vec<F>,
+    coefs: Vec<F>,
 }
 
 /// Polynomial struct where all coefficients are bit-strings.
@@ -18,7 +21,7 @@ pub struct Poly<F> {
 /// where we need to lift binary polynomials into the full ring domain.
 #[derive(Serialize, Deserialize, Hash, Clone, Default, Debug)]
 pub struct BitwisePoly {
-    pub coefs: Vec<u8>,
+    coefs: Vec<u8>,
 }
 
 #[cfg(feature = "extension_degree_3")]
@@ -80,10 +83,79 @@ where
     ) -> ResiduePoly<Z, EXTENSION_DEGREE>;
 }
 
+impl<Z> Poly<Z> {
+    pub fn coef(&self, idx: usize) -> Z
+    where
+        Z: Zero + Copy,
+    {
+        if idx < self.coefs.len() {
+            self.coefs[idx]
+        } else {
+            Z::ZERO
+        }
+    }
+
+    pub fn coefs(&self) -> &[Z] {
+        &self.coefs
+    }
+
+    pub fn set_coef(&mut self, idx: usize, value: Z)
+    where
+        Z: Zero + Copy,
+    {
+        if idx < self.coefs.len() {
+            self.coefs[idx] = value;
+        } else {
+            // extend the coefficients vector with zeros if needed
+            self.coefs.resize(idx + 1, Z::ZERO);
+            self.coefs[idx] = value;
+        }
+    }
+
+    pub fn get_mut(&mut self, idx: usize) -> &mut Z
+    where
+        Z: Zero + Copy,
+    {
+        if idx < self.coefs.len() {
+            &mut self.coefs[idx]
+        } else {
+            self.set_coef(idx, Z::ZERO);
+            self.get_mut(idx)
+        }
+    }
+
+    pub fn into_container(self) -> Vec<Z> {
+        self.coefs
+    }
+}
+
+impl BitwisePoly {
+    pub fn coef(&self, idx: usize) -> u8 {
+        if idx < self.coefs.len() {
+            self.coefs[idx]
+        } else {
+            0
+        }
+    }
+
+    pub fn coefs(&self) -> &[u8] {
+        &self.coefs
+    }
+
+    pub fn set_coef(&mut self, idx: usize, value: u8) {
+        if idx < self.coefs.len() {
+            self.coefs[idx] = value;
+        } else {
+            // extend the coefficients vector with zeros if needed
+            self.coefs.resize(idx + 1, 0);
+            self.coefs[idx] = value;
+        }
+    }
+}
+
 impl<Z> Poly<Z>
 where
-    Z: Ring,
-    Z: RingEmbed,
+    Z: RingWithExceptionalSequence,
     Z: Invert,
 {
     ///Outputs a vector of the monomials (X - embed(party_id))/(party_id)
@@ -96,7 +168,7 @@ where
         //TODO: This could be memoized
         let mut inv_coefs = (1..=num_parties)
             .map(|idx| {
-                let gamma = Z::embed_exceptional_set(idx)?;
+                let gamma = Z::get_from_exceptional_sequence(idx)?;
                 Z::invert(Z::ZERO - gamma)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -105,7 +177,7 @@ where
         // embed party IDs as invertible x-points on the polynomial
         //TODO: This could be memoized
         let x_coords: Vec<_> = (0..=num_parties)
-            .map(Z::embed_exceptional_set)
+            .map(Z::get_from_exceptional_sequence)
             .collect::<Result<Vec<_>, _>>()?;
 
         // compute additive inverse of embedded party IDs
@@ -121,12 +193,6 @@ where
             res.push((x.clone() + neg_parties[p].clone()) * Self::from_coefs(vec![inv_coefs[p]]))
         }
         Ok((res, x_coords))
-    }
-}
-
-impl<R> Poly<R> {
-    pub fn from_coefs(coefs: Vec<R>) -> Self {
-        Poly { coefs }
     }
 }
 
@@ -170,6 +236,37 @@ where
         res
     }
 }
+impl<F> Poly<F>
+where
+    F: Zero,
+    F: PartialEq,
+{
+    pub fn from_coefs(coefs: Vec<F>) -> Self {
+        let mut poly = Poly { coefs };
+        poly.compress();
+        poly
+    }
+
+    pub fn pop(&mut self) -> Option<F> {
+        if self.coefs.is_empty() {
+            None
+        } else {
+            let last = self.coefs.pop().unwrap();
+            Some(last)
+        }
+    }
+
+    /// remove zero-coefficients from the highest degree variables
+    pub(crate) fn compress(&mut self) {
+        while let Some(c) = self.coefs.last() {
+            if c == &F::ZERO {
+                self.coefs.pop();
+            } else {
+                break;
+            }
+        }
+    }
+}
 
 impl<F> Poly<F>
 where
@@ -200,12 +297,17 @@ where
     /// return a poly that is constant zero
     pub fn zero() -> Self {
         Poly {
-            coefs: vec![F::ZERO],
+            // an empty polynomial is considered zero
+            coefs: vec![],
         }
     }
 
     /// return a poly that is constant zero and has n zero coefficients
-    pub fn zeros(n: usize) -> Self {
+    ///
+    /// Note that this polynomial is *not* compressed!
+    /// The caller should make sure compress is called
+    /// at the end of the operation that uses this zero polynoimal.
+    fn zeros(n: usize) -> Self {
         Poly {
             coefs: vec![F::ZERO; n],
         }
@@ -219,17 +321,6 @@ where
             }
         }
         F::ZERO
-    }
-
-    /// remove zero-coefficients from the highest degree variables
-    fn compress(&mut self) {
-        while let Some(c) = self.coefs.last() {
-            if c == &F::ZERO {
-                self.coefs.pop();
-            } else {
-                break;
-            }
-        }
     }
 }
 
@@ -265,6 +356,7 @@ impl<F> Poly<F>
 where
     F: Sample,
     F: Zero + One,
+    F: PartialEq,
 {
     /// sample a random poly of given degree with `zero_coef` as fixed value for the constant term
     pub fn sample_random_with_fixed_constant<U: Rng + CryptoRng>(
@@ -274,7 +366,7 @@ where
     ) -> Self {
         let mut coefs: Vec<_> = (0..degree).map(|_| F::sample(rng)).collect();
         coefs.insert(0, zero_coef);
-        Poly { coefs }
+        Poly::from_coefs(coefs)
     }
 }
 
@@ -400,6 +492,7 @@ impl<R: Ring> Mul<&R> for Poly<R> {
         for i in 0..self.coefs.len() {
             self.coefs[i] *= *other;
         }
+        self.compress();
         self
     }
 }
@@ -422,6 +515,7 @@ impl<F: Field> Div<&F> for Poly<F> {
         for i in 0..self.coefs.len() {
             self.coefs[i] /= *other;
         }
+        self.compress();
         self
     }
 }
@@ -448,13 +542,22 @@ impl<F: Field> Div<&Poly<F>> for Poly<F> {
 }
 
 /// computes quotient `q` and remainder `r` for dividing `a / b`, s.t. `a = q*b + r`
+/// Assume the input polynomials are compressed, i.e., no leading zeros.
 fn quo_rem<F: Field>(a: Poly<F>, b: &Poly<F>) -> (Poly<F>, Poly<F>) {
-    let a_len = a.coefs.len();
-    let b_len = b.coefs.len();
+    let a_len = a.deg() + 1;
+    let b_len = b.deg() + 1;
+
+    if b_len == 1 && b.coef(0) == F::ZERO {
+        panic!("division by 0 in quo_rem");
+    }
+
+    if a_len == 1 && a.coef(0) == F::ZERO {
+        return (Poly::zero(), Poly::zero());
+    }
 
     let t = b.highest_coefficient().invert();
 
-    let mut q = Poly::zeros(a.coefs.len());
+    let mut q = Poly::zeros(a_len);
     let mut r = a;
 
     if a_len >= b_len {
@@ -498,9 +601,14 @@ pub fn lagrange_polynomials<F: Field>(points: &[F]) -> Vec<Poly<F>> {
 /// interpolate a polynomial through coordinates where points holds the x-coordinates and values holds the y-coordinates
 pub fn lagrange_interpolation<F: Field>(points: &[F], values: &[F]) -> anyhow::Result<Poly<F>> {
     let ls = F::memoize_lagrange(points)?;
-    assert_eq!(ls.len(), values.len());
+    if ls.len() != values.len() {
+        return Err(anyhow_error_and_log(
+            "Lagrange interpolation failure: mismatch between number of points and values"
+                .to_string(),
+        ));
+    }
     let mut res = Poly::zero();
-    for (li, vi) in ls.into_iter().zip(values.iter()) {
+    for (li, vi) in ls.into_iter().zip_eq(values.iter()) {
         let term = li * vi;
         res = res + term;
     }
@@ -598,8 +706,7 @@ pub fn gao_decoding<F: Field>(
 
     if !rem.is_zero() {
         Err(anyhow_error_and_log(format!(
-            "Gao decoding failure: Division remainder is not zero but {:?}.",
-            rem
+            "Gao decoding failure: Division remainder is not zero but {rem:?}."
         )))
     } else if h.deg() >= k {
         Err(anyhow_error_and_log(format!("Gao decoding failure: Division result is of too high degree {}, but should be at most {}.", h.deg(), k-1)))
@@ -669,8 +776,8 @@ mod tests {
             proptest::collection::vec(any::<u8>().prop_map(GF16::from), 1..10)
         )) {
 
-            let a = Poly { coefs: coefs_a };
-            let b = Poly { coefs: coefs_b };
+            let a = Poly::from_coefs(coefs_a);
+            let b = Poly::from_coefs(coefs_b);
 
             if !b.is_zero() {
                 let (q, r) = a.clone() / b.clone();
@@ -681,14 +788,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Division by 0 in GF16")]
+    #[should_panic(expected = "division by 0 in quo_rem")]
     fn test_specific_panic() {
-        let a = Poly {
-            coefs: vec![GF16::from(15), GF16::from(3)],
-        };
-        let b = Poly {
-            coefs: vec![GF16::from(0)],
-        };
+        let a = Poly::from_coefs(vec![GF16::from(15), GF16::from(3)]);
+        let b = Poly::from_coefs(vec![GF16::from(0)]);
         let (_q, _r) = a / b;
     }
 
@@ -780,7 +883,7 @@ mod tests {
         let ring_evals: Vec<ResiduePolyF4Z128> = party_ids
             .iter()
             .map(|id| {
-                let embedded_xi = ResiduePolyF4Z128::embed_exceptional_set(*id)?;
+                let embedded_xi = ResiduePolyF4Z128::get_from_exceptional_sequence(*id)?;
                 Ok(lifted_f.eval(&embedded_xi))
             })
             .collect::<anyhow::Result<Vec<_>>>()
@@ -796,5 +899,20 @@ mod tests {
                 "party with index {party_id} failed with wrong evaluation"
             );
         }
+    }
+
+    #[test]
+    fn test_compress() {
+        let mut poly = Poly {
+            coefs: vec![GF16::from(3), GF16::from(0), GF16::from(0)],
+        };
+        poly.compress();
+        assert_eq!(poly.coefs, vec![GF16::from(3)]);
+
+        let mut poly2 = Poly {
+            coefs: vec![GF16::from(0)],
+        };
+        poly2.compress();
+        assert_eq!(poly2.coefs, vec![]);
     }
 }

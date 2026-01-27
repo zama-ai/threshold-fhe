@@ -85,10 +85,7 @@ where
 }
 
 #[derive(Default, Clone)]
-pub struct InMemoryBitPreprocessing<Z>
-where
-    Z: Ring,
-{
+pub struct InMemoryBitPreprocessing<Z: Clone> {
     pub available_bits: Vec<Share<Z>>,
 }
 
@@ -104,14 +101,15 @@ impl<Z: Ring> BitPreprocessing<Z> for InMemoryBitPreprocessing<Z> {
     }
 
     fn next_bit_vec(&mut self, amount: usize) -> anyhow::Result<Vec<Share<Z>>> {
-        if self.available_bits.len() >= amount {
-            Ok(self.available_bits.drain(0..amount).collect())
-        } else {
-            Err(anyhow_error_and_log(format!(
+        if self.available_bits.len() < amount {
+            return Err(anyhow_error_and_log(format!(
                 "Not enough bits to drain, need {amount}, got {}",
                 self.available_bits.len()
-            )))
+            )));
         }
+
+        // Use drain to safely extract exactly 'amount' bits
+        Ok(self.available_bits.drain(0..amount).collect())
     }
 
     fn bits_len(&self) -> usize {
@@ -120,10 +118,7 @@ impl<Z: Ring> BitPreprocessing<Z> for InMemoryBitPreprocessing<Z> {
 }
 
 #[derive(Default, Clone)]
-pub struct InMemoryBasePreprocessing<R>
-where
-    R: Ring,
-{
+pub struct InMemoryBasePreprocessing<R: Clone> {
     pub available_triples: Vec<Triple<R>>,
     pub available_randoms: Vec<Share<R>>,
 }
@@ -192,7 +187,7 @@ mod tests {
                 // Test what happens when no more triples are preset
                 #[test]
                 fn [<test_no_more_elements_ $z:lower>]() {
-                    let share = Share::new(Role::indexed_by_one(1), ResiduePolyF4::<$z>::from_scalar(Wrapping(1)));
+                    let share = Share::new(Role::indexed_from_one(1), ResiduePolyF4::<$z>::from_scalar(Wrapping(1)));
                     let triple = Triple::new(share.clone(), share.clone(), share.clone());
                     const TRIPLE_BATCH_SIZE: usize = 10; // Replace 10 with the desired value
 
@@ -215,12 +210,12 @@ mod tests {
                         .next_triple()
                         .unwrap_err()
                         .to_string()
-                        .contains("Not enough triples to pop 1"));
+                        .contains("No triples available"));
                     assert!(preproc
                         .next_random()
                         .unwrap_err()
                         .to_string()
-                        .contains("Not enough randomness to pop 1"));
+                        .contains("No randomness available"));
                 }
             }
         }
@@ -230,6 +225,6 @@ mod tests {
     test_preprocessing![Z128, u128];
 }
 
-mod bitdec;
-mod dkg;
-mod noiseflood;
+pub(crate) mod bitdec;
+pub(crate) mod dkg;
+pub(crate) mod noiseflood;

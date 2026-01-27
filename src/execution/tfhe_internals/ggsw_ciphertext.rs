@@ -10,7 +10,7 @@
 //! an MPC multiplication inside the GGSW encryption
 //! by asking the result of the mults to be input as part of the plaintext.
 //! See [`ggsw_encode_message`]
-use std::ops::Neg;
+use std::{ops::Neg, sync::Arc};
 
 use crate::{
     algebra::{
@@ -20,7 +20,7 @@ use crate::{
     error::error_handler::anyhow_error_and_log,
     execution::{
         online::{preprocessing::TriplePreprocessing, triple::mult_list},
-        runtime::session::BaseSessionHandles,
+        runtime::sessions::base_session::BaseSessionHandles,
         sharing::share::Share,
         tfhe_internals::utils::slice_wrapping_scalar_mul_assign,
     },
@@ -34,13 +34,13 @@ use super::{
     parameters::EncryptionType,
     randomness::MPCEncryptionRandomGenerator,
 };
-use itertools::{EitherOrBoth, Itertools};
-use rand::{CryptoRng, Rng};
+use itertools::Itertools;
+use rayon::prelude::*;
 use tfhe::{
     core_crypto::{
         commons::{
             math::decomposition::DecompositionLevel, parameters::GlweSize,
-            traits::ByteRandomGenerator,
+            traits::ParallelByteRandomGenerator,
         },
         entities::ggsw_level_matrix_size,
     },
@@ -140,9 +140,8 @@ impl<Z: BaseRing, const EXTENSION_DEGREE: usize> GgswCiphertextShare<Z, EXTENSIO
 }
 
 pub async fn ggsw_encode_messages<
-    Rnd: Rng + CryptoRng,
     Z: BaseRing,
-    S: BaseSessionHandles<Rnd>,
+    S: BaseSessionHandles,
     P,
     const EXTENSION_DEGREE: usize,
 >(
@@ -158,14 +157,18 @@ where
     let num_messages = messages.len();
     let size_mult = num_messages * key_bits.data.len();
     let triples = preproc.next_triple_vec(size_mult)?;
-    let vectorized_message = messages
-        .iter()
-        .flat_map(|message| (0..key_bits.data.len()).map(|_| *message))
-        .collect_vec();
-    let vectorized_key_bits = (0..num_messages)
-        .flat_map(|_| key_bits.data.clone())
-        .collect_vec();
-    let prods = mult_list(&vectorized_key_bits, &vectorized_message, triples, session).await?;
+    let vectorized_message = Arc::new(
+        messages
+            .iter()
+            .flat_map(|message| (0..key_bits.data.len()).map(|_| *message))
+            .collect_vec(),
+    );
+    let vectorized_key_bits = Arc::new(
+        (0..num_messages)
+            .flat_map(|_| key_bits.data.clone())
+            .collect_vec(),
+    );
+    let prods = mult_list(vectorized_key_bits, vectorized_message, triples, session).await?;
 
     let glwe_dimension = key_bits.glwe_dimension().0;
     let polynomial_size = key_bits.polynomial_size().0;
@@ -207,9 +210,8 @@ where
 ///This functions compute the necessary encoding required for GGSW
 ///In particular this does the MPC multiplication between the shared key bits and the secret message
 pub async fn ggsw_encode_message<
-    Rnd: Rng + CryptoRng,
     Z: BaseRing,
-    S: BaseSessionHandles<Rnd>,
+    S: BaseSessionHandles,
     P,
     const EXTENSION_DEGREE: usize,
 >(
@@ -243,25 +245,32 @@ pub fn encrypt_constant_ggsw_ciphertext<Z, Gen, const EXTENSION_DEGREE: usize>(
     encoded: Vec<Vec<ResiduePoly<Z, EXTENSION_DEGREE>>>,
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
     encryption_type: EncryptionType,
-) -> anyhow::Result<()>
-where
+) where
     Z: BaseRing,
-    Gen: ByteRandomGenerator,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    Gen: ParallelByteRandomGenerator,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     let max_level = output.decomposition_level_count();
     let gen_iter = generator
-        .fork_ggsw_to_ggsw_levels(max_level, output.glwe_size(), output.polynomial_size())
+        .fork_ggsw_to_ggsw_levels(
+            max_level,
+            output.glwe_size(),
+            output.polynomial_size(),
+            encryption_type,
+        )
         .expect("Failed to split generator into ggsw levels");
 
     let output_glwe_size = output.glwe_size();
     let output_polynomial_size = output.polynomial_size();
     let decomp_base_log = output.decomposition_base_log();
 
-    for (level_index, level_matrix_generator) in
-        output.data.iter_mut().zip_longest(gen_iter).enumerate()
-    {
-        if let EitherOrBoth::Both(level_matrix, mut generator) = level_matrix_generator {
+    // zip_eq can panic, but if it does it is due to a bug as we expect both vectors to be of same size
+    output
+        .data
+        .par_iter_mut()
+        .zip_eq(gen_iter)
+        .enumerate()
+        .for_each(|(level_index, (level_matrix, mut generator))| {
             let decomp_level = DecompositionLevel(max_level.0 - level_index);
 
             //Note that here tfhe-rs still only works on the msg and
@@ -274,20 +283,18 @@ where
             };
 
             let gen_iter = generator
-                .fork_ggsw_level_to_glwe(output_glwe_size, output_polynomial_size)
+                .fork_ggsw_level_to_glwe(output_glwe_size, output_polynomial_size, encryption_type)
                 .expect("Failed to split generator into glwe");
 
             let last_row_index = level_matrix.glwe_size().0 - 1;
 
-            for row_index_row_as_glwe_generator in level_matrix
+            // zip_eq can panic, but if it does it is due to a bug as we expect both vectors to be of same size
+            level_matrix
                 .as_mut_glwe_list()
-                .iter_mut()
+                .par_iter_mut()
                 .enumerate()
-                .zip_longest(gen_iter)
-            {
-                if let EitherOrBoth::Both((row_index, row_as_glwe), mut generator) =
-                    row_index_row_as_glwe_generator
-                {
+                .zip_eq(gen_iter)
+                .for_each(|((row_index, row_as_glwe), mut generator)| {
                     encrypt_constant_ggsw_level_matrix_row(
                         glwe_secret_key_share,
                         (row_index, last_row_index),
@@ -295,24 +302,13 @@ where
                         row_as_glwe,
                         encoded
                             .get(row_index)
-                            .ok_or_else(|| {
-                                anyhow_error_and_log(format!(
-                                    "Can't access encoded at index {row_index}"
-                                ))
-                            })?
+                            .expect("Can't access encoded at index {row_index}")
                             .clone(),
                         &mut generator,
-                    )?;
-                } else {
-                    return Err(anyhow_error_and_log("zip error.".to_string()));
-                }
-            }
-        } else {
-            return Err(anyhow_error_and_log("zip error.".to_string()));
-        }
-    }
-
-    Ok(())
+                    )
+                    .expect("Failed to encrypt constant GGSW level matrix row");
+                });
+        });
 }
 
 fn encrypt_constant_ggsw_level_matrix_row<Z, Gen, const EXTENSION_DEGREE: usize>(
@@ -325,8 +321,8 @@ fn encrypt_constant_ggsw_level_matrix_row<Z, Gen, const EXTENSION_DEGREE: usize>
 ) -> anyhow::Result<()>
 where
     Z: BaseRing,
-    Gen: ByteRandomGenerator,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    Gen: ParallelByteRandomGenerator,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     //Do proper scaling using the provided list of secret shared plaintexts
     if row_index < last_row_index {
@@ -344,7 +340,8 @@ where
             * factor;
     }
 
-    encrypt_glwe_ciphertext_assign(glwe_secret_key_share, row_as_glwe, generator)
+    encrypt_glwe_ciphertext_assign(glwe_secret_key_share, row_as_glwe, generator);
+    Ok(())
 }
 
 ///Returns a tuple (number_of_triples,number_of_random) required for mpc ggsw encryption
@@ -381,19 +378,21 @@ mod tests {
             CiphertextModulus,
         },
     };
-    use tfhe_csprng::generators::SoftwareRandomGenerator;
+    use tfhe_csprng::{generators::SoftwareRandomGenerator, seeders::XofSeed};
 
     use crate::{
         algebra::{galois_rings::degree_4::ResiduePolyF4Z64, structure_traits::Ring},
         execution::{
             online::{
-                gen_bits::{BitGenEven, RealBitGenEven},
+                gen_bits::{BitGenEven, SecureBitGenEven},
                 preprocessing::dummy::DummyPreprocessing,
                 secret_distributions::{RealSecretDistributions, SecretDistributions},
             },
             runtime::{
                 party::Role,
-                session::{LargeSession, ParameterHandles},
+                sessions::{
+                    large_session::LargeSession, session_parameters::GenericParameterHandles,
+                },
             },
             sharing::{shamir::ShamirSharings, share::Share},
             tfhe_internals::{
@@ -417,8 +416,8 @@ mod tests {
     //Test encryption with our code, decryption with tfhe-rs
     //Note that this does not really test the whole ggsw encryption, as decryption
     //only cares about the last row of the encryption matrix
-    #[test]
-    fn test_ggsw_encryption() {
+    #[tokio::test]
+    async fn test_ggsw_encryption() {
         //Testing with NIST params in P=8
         let polynomial_size = 512_usize;
         let polynomial_size = PolynomialSize(polynomial_size);
@@ -433,7 +432,8 @@ mod tests {
         let num_key_bits = glwe_dimension.0 * polynomial_size.0;
 
         let mut task = |mut session: LargeSession| async move {
-            let my_role = session.my_role().unwrap();
+            let xof_seed = XofSeed::new_u128(seed, *b"TEST_GEN");
+            let my_role = session.my_role();
             let shared_message = ShamirSharings::share(
                 &mut AesRng::seed_from_u64(0),
                 ResiduePolyF4Z64::from_scalar(Wrapping(msg)),
@@ -441,17 +441,21 @@ mod tests {
                 session.threshold() as usize,
             )
             .unwrap()
-            .shares[my_role.zero_based()];
+            .shares[&my_role];
 
             let t_uniform_amount =
                 polynomial_size.0 * glwe_dimension.to_glwe_size().0 * decomp_level_count.0;
 
-            let mut large_preproc = DummyPreprocessing::new(seed as u64, session.clone());
+            let mut large_preproc = DummyPreprocessing::new(seed as u64, &session);
 
             let glwe_secret_key_share = GlweSecretKeyShare {
-                data: RealBitGenEven::gen_bits_even(num_key_bits, &mut large_preproc, &mut session)
-                    .await
-                    .unwrap(),
+                data: SecureBitGenEven::gen_bits_even(
+                    num_key_bits,
+                    &mut large_preproc,
+                    &mut session,
+                )
+                .await
+                .unwrap(),
                 polynomial_size,
             };
 
@@ -475,7 +479,7 @@ mod tests {
             .collect_vec();
 
             let mut mpc_encryption_rng = MPCEncryptionRandomGenerator {
-                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(seed),
+                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(xof_seed),
                 noise: MPCNoiseRandomGenerator {
                     vec: vec_tuniform_noise,
                 },
@@ -495,8 +499,7 @@ mod tests {
                 encoded_message,
                 &mut mpc_encryption_rng,
                 EncryptionType::Bits64,
-            )
-            .unwrap();
+            );
 
             (my_role, glwe_secret_key_share, output)
         };
@@ -519,7 +522,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         let mut glwe_key_shares: HashMap<Role, Vec<Share<_>>> = HashMap::new();
         let mut ggsw_ctxt_shares: HashMap<Role, Vec<Share<_>>> = HashMap::new();
@@ -579,17 +583,16 @@ mod tests {
             assert_eq!(underlying_container.len(), ref_masks[glwe_idx].len());
             for (c, m) in underlying_container
                 .iter_mut()
-                .zip(ref_masks[glwe_idx].clone())
+                .zip_eq(ref_masks[glwe_idx].clone())
             {
                 *c = m.0;
             }
 
             let mut glwe_ctxt_mut_body = glwe_ctxt.get_mut_body();
             let underlying_container = glwe_ctxt_mut_body.as_mut();
-            assert_eq!(underlying_container.len(), bodies[glwe_idx].len());
             for (c, m) in underlying_container
                 .iter_mut()
-                .zip(bodies[glwe_idx].clone())
+                .zip_eq(bodies[glwe_idx].clone())
             {
                 *c = m.0;
             }

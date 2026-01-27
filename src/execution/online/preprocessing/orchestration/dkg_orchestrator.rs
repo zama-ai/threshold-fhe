@@ -3,18 +3,14 @@ use super::{
         dkg_bits_processor::DkgBitProcessor, randoms_aggregator::RandomsAggregator,
         triples_aggregator::TriplesAggregator,
     },
-    producers::{
-        bits_producer::{LargeSessionBitProducer, SmallSessionBitProducer},
-        randoms_producer::{LargeSessionRandomProducer, SmallSessionRandomProducer},
-        triples_producer::{LargeSessionTripleProducer, SmallSessionTripleProducer},
-    },
+    producer_traits::{BitProducerTrait, RandomProducerTrait, TripleProducerTrait},
     progress_tracker::ProgressTracker,
 };
 use crate::{
     algebra::{
         base_ring::{Z128, Z64},
         galois_rings::common::ResiduePoly,
-        structure_traits::{Derive, ErrorCorrect, Invert, RingEmbed, Solve},
+        structure_traits::{Derive, ErrorCorrect, Invert, Solve},
     },
     error::error_handler::anyhow_error_and_log,
     execution::{
@@ -25,11 +21,15 @@ use crate::{
                     BATCH_SIZE_BITS, BATCH_SIZE_TRIPLES, CHANNEL_BUFFER_SIZE,
                     TRACKER_LOG_PERCENTAGE,
                 },
+                orchestration::producer_traits::ProducerFactory,
                 DKGPreprocessing, PreprocessorFactory,
             },
             triple::Triple,
         },
-        runtime::session::{LargeSession, ParameterHandles, SmallSession},
+        runtime::sessions::{
+            large_session::LargeSession, session_parameters::DeSerializationRunTime,
+            session_parameters::ParameterHandles, small_session::SmallSession,
+        },
         sharing::share::Share,
         small_execution::prf::PRSSConversions,
         tfhe_internals::parameters::{DKGParams, NoiseInfo},
@@ -37,11 +37,11 @@ use crate::{
 };
 use itertools::Itertools;
 use num_integer::div_ceil;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::{
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Mutex,
+        Mutex, RwLock,
     },
     task::JoinSet,
 };
@@ -57,7 +57,7 @@ pub struct PreprocessingOrchestrator<Z> {
     bit_progress_tracker: ProgressTracker,
     // For testing purposes, can set the percentage of offline phase
     // we actually want to run
-    #[cfg(feature = "choreographer")]
+    #[cfg(feature = "testing")]
     percentage_offline: usize,
 }
 
@@ -91,14 +91,12 @@ impl<Z> PreprocessingOrchestrator<Z> {
     pub fn get_bit_progress_tracker(&self) -> ProgressTracker {
         self.bit_progress_tracker.clone()
     }
-}
 
-impl<Z> PreprocessingOrchestrator<Z> {
     fn num_tuniform_raw_bits_required(&self) -> (Vec<NoiseInfo>, usize) {
         get_num_tuniform_raw_bits_required(
             &self.params,
             self.keyset_config,
-            #[cfg(feature = "choreographer")]
+            #[cfg(feature = "testing")]
             self.percentage_offline,
         )
     }
@@ -107,7 +105,7 @@ impl<Z> PreprocessingOrchestrator<Z> {
         get_num_correlated_randomness_required(
             &self.params,
             self.keyset_config,
-            #[cfg(feature = "choreographer")]
+            #[cfg(feature = "testing")]
             self.percentage_offline,
         )
     }
@@ -132,7 +130,7 @@ impl<const EXTENSION_DEGREE: usize> PreprocessingOrchestrator<ResiduePoly<Z64, E
         let (num_bits, num_triples, num_randomness) = get_num_correlated_randomness_required(
             &params,
             keyset_config,
-            #[cfg(feature = "choreographer")]
+            #[cfg(feature = "testing")]
             100,
         );
 
@@ -149,12 +147,12 @@ impl<const EXTENSION_DEGREE: usize> PreprocessingOrchestrator<ResiduePoly<Z64, E
             triple_progress_tracker,
             random_progress_tracker,
             bit_progress_tracker,
-            #[cfg(feature = "choreographer")]
+            #[cfg(feature = "testing")]
             percentage_offline: 100,
         })
     }
 
-    #[cfg(feature = "choreographer")]
+    #[cfg(feature = "testing")]
     pub fn new_partial<F: PreprocessorFactory<EXTENSION_DEGREE> + ?Sized>(
         factory: &mut F,
         params: DKGParams,
@@ -209,7 +207,7 @@ impl<const EXTENSION_DEGREE: usize> PreprocessingOrchestrator<ResiduePoly<Z128, 
         let (num_bits, num_triples, num_randomness) = get_num_correlated_randomness_required(
             &params,
             keyset_config,
-            #[cfg(feature = "choreographer")]
+            #[cfg(feature = "testing")]
             100,
         );
 
@@ -226,12 +224,12 @@ impl<const EXTENSION_DEGREE: usize> PreprocessingOrchestrator<ResiduePoly<Z128, 
             triple_progress_tracker,
             random_progress_tracker,
             bit_progress_tracker,
-            #[cfg(feature = "choreographer")]
+            #[cfg(feature = "testing")]
             percentage_offline: 100,
         })
     }
 
-    #[cfg(feature = "choreographer")]
+    #[cfg(feature = "testing")]
     pub fn new_partial<F: PreprocessorFactory<EXTENSION_DEGREE> + ?Sized>(
         factory: &mut F,
         params: DKGParams,
@@ -316,30 +314,31 @@ pub(crate) fn create_channels<R: Clone>(
     )
 }
 
-type SmallSessionDkgResult<R> =
-    anyhow::Result<(Vec<SmallSession<R>>, Box<dyn DKGPreprocessing<R>>)>;
-
-impl<R> PreprocessingOrchestrator<R>
+impl<Z> PreprocessingOrchestrator<Z>
 where
-    R: PRSSConversions + ErrorCorrect + Invert + Derive + RingEmbed + Solve,
+    Z: PRSSConversions + ErrorCorrect + Invert + Derive + Solve,
 {
     ///Start the orchestration of the preprocessing, returning a filled [`DKGPreprocessing`].
     ///
-    ///Expects a vector of [`SmallSession`] __(at least 2!)__, using each of them in parallel for the preprocessing.
+    ///Expects a vector of sessions implementing the Session trait __(at least 2!)__, using each of them in parallel for the preprocessing.
     ///
     ///__NOTE__ For now we dedicate 1 in 20 sessions
     /// to raw triple and randomness generation and the rest to bit generation
     #[instrument(name="Preprocessing",skip(self,sessions),fields(num_sessions=?sessions.len(), percentage_offline))]
-    pub async fn orchestrate_small_session_dkg_processing(
+    pub(crate) async fn orchestrate_dkg_processing<S, P>(
         self,
-        mut sessions: Vec<SmallSession<R>>,
-    ) -> SmallSessionDkgResult<R> {
-        #[cfg(feature = "choreographer")]
+        mut sessions: Vec<S>,
+    ) -> anyhow::Result<(Vec<S>, Box<dyn DKGPreprocessing<Z>>)>
+    where
+        S: ParameterHandles + 'static,
+        P: ProducerFactory<Z, S>,
+    {
+        #[cfg(feature = "testing")]
         tracing::Span::current().record("percentage_offline", self.percentage_offline);
 
-        let party_id = sessions[0].own_identity();
+        let party_id = sessions[0].my_role();
         for session in sessions.iter() {
-            assert_eq!(party_id, session.own_identity());
+            assert_eq!(party_id, session.my_role());
         }
 
         let (num_bits, num_triples, num_randomness) = self.num_correlated_randomness_required();
@@ -347,140 +346,10 @@ where
         //Ensures sessions are sorted by session id
         sessions.sort_by_key(|session| session.session_id());
 
-        //Dedicate 1 in 20 sessions to raw triples, the rest to bits
-        let num_triples_sessions = div_ceil(sessions.len(), 20);
-        let triples_sessions: Vec<_> = (0..num_triples_sessions)
-            .map(|_| {
-                sessions.pop().ok_or_else(|| {
-                    anyhow_error_and_log("Fail to retrieve sessions for basic preprocessing")
-                })
-            })
-            .try_collect()?;
-
-        //Create all the channels we need for the producer to communicate their batches
-        let (
-            (triple_sender_channels, triple_receiver_channels),
-            (random_sender_channels, random_receiver_channels),
-            (bit_sender_channels, bit_receiver_channels),
-        ) = create_channels(num_triples_sessions, 1, sessions.len());
-
-        let current_span = tracing::Span::current();
-        //Start the processors
-        let mut joinset_processors = JoinSet::new();
-
-        let triple_writer = self.dkg_preproc.clone();
-        let triple_aggregator =
-            TriplesAggregator::new(triple_writer, triple_receiver_channels, num_triples);
-        joinset_processors.spawn(triple_aggregator.run().instrument(current_span.clone()));
-
-        let random_writer = self.dkg_preproc.clone();
-        let random_aggregator =
-            RandomsAggregator::new(random_writer, random_receiver_channels, num_randomness);
-        joinset_processors.spawn(random_aggregator.run().instrument(current_span.clone()));
-
-        let bit_writer = self.dkg_preproc.clone();
-        let (tuniform_productions, num_bits_required) = self.num_tuniform_raw_bits_required();
-        let bit_processor = DkgBitProcessor::new(
-            bit_writer,
-            tuniform_productions,
-            num_bits_required,
-            bit_receiver_channels,
-        );
-        joinset_processors.spawn(bit_processor.run().instrument(current_span.clone()));
-
-        //Start the producers
-        let triple_producer = SmallSessionTripleProducer::new(
-            BATCH_SIZE_TRIPLES,
-            num_triples,
-            triples_sessions,
-            triple_sender_channels,
-            Some(self.triple_progress_tracker),
-        )?;
-        let mut triple_producer_handles = triple_producer.start_triple_production();
-
-        let bit_producer = SmallSessionBitProducer::new(
-            BATCH_SIZE_BITS,
-            num_bits,
-            sessions,
-            bit_sender_channels,
-            Some(self.bit_progress_tracker),
-        )?;
-        let mut bit_producer_handles = bit_producer.start_bit_gen_even_production();
-
-        //Join on the triple producers as they finish before bit producers
-        let mut res_sessions = Vec::new();
-        while let Some(session) = triple_producer_handles.join_next().await {
-            match session {
-                Ok(Ok(session)) => {
-                    res_sessions.push(session);
-                }
-                other => {
-                    let _ = other.unwrap();
-                }
-            }
+        // Set the deserialization runtime for each session
+        for session in sessions.iter_mut() {
+            session.set_deserialization_runtime(DeSerializationRunTime::Rayon);
         }
-
-        res_sessions.sort_by_key(|session| session.session_id());
-
-        //Start producers for randomness by re-using one of the session used for triple generation
-        let randomness_session = res_sessions
-            .pop()
-            .ok_or_else(|| anyhow_error_and_log("Failed to pop a session for randomness"))?;
-
-        let randomness_producer = SmallSessionRandomProducer::new(
-            num_randomness,
-            num_randomness,
-            vec![randomness_session],
-            random_sender_channels,
-            Some(self.random_progress_tracker),
-        )?;
-        let mut randomness_producer_handle = randomness_producer.start_random_production();
-
-        //Join on bits and randomness producers
-        while let Some(Ok(Ok(session))) = randomness_producer_handle.join_next().await {
-            res_sessions.push(session);
-        }
-        while let Some(Ok(Ok(session))) = bit_producer_handles.join_next().await {
-            res_sessions.push(session);
-        }
-
-        res_sessions.sort_by_key(|session| session.session_id());
-        //Join on the processors
-        while joinset_processors.join_next().await.is_some() {}
-
-        //Return handle to preprocessing bucket
-        let dkg_preproc_return = Arc::into_inner(self.dkg_preproc).ok_or_else(|| {
-            anyhow_error_and_log("Error getting hold of dkg preprocessing store inside the Arc")
-        })?;
-        let dkg_preproc_return = dkg_preproc_return.into_inner().map_err(|_| {
-            anyhow_error_and_log("Error consuming dkg preprocessing inside the Lock")
-        })?;
-        Ok((res_sessions, dkg_preproc_return))
-    }
-
-    ///Start the orchestration of the preprocessing, returning a filled [`DKGPreprocessing`].
-    ///
-    ///Expects a vector of [`LargeSession`] __(at least 2!)__, using each of them in parallel for the preprocessing.
-    ///
-    ///__NOTE__ For now we dedicate 1 in 20 sessions
-    /// to raw triple and randomness generation and the rest to bit generation
-    #[instrument(name="Preprocessing",skip(self,sessions),fields(num_sessions=?sessions.len(), percentage_offline))]
-    pub async fn orchestrate_large_session_dkg_processing(
-        self,
-        mut sessions: Vec<LargeSession>,
-    ) -> anyhow::Result<(Vec<LargeSession>, Box<dyn DKGPreprocessing<R>>)> {
-        #[cfg(feature = "choreographer")]
-        tracing::Span::current().record("percentage_offline", self.percentage_offline);
-
-        let party_id = sessions[0].own_identity();
-        for session in sessions.iter() {
-            assert_eq!(party_id, session.own_identity());
-        }
-
-        let (num_bits, num_triples, num_randomness) = self.num_correlated_randomness_required();
-
-        //Ensures sessions are sorted by session id
-        sessions.sort_by_key(|session| session.session_id());
 
         //Dedicate 1 in 20 sessions to raw triples, the rest to bits
         let num_basic_sessions = div_ceil(sessions.len(), 20);
@@ -524,7 +393,7 @@ where
         joinset_processors.spawn(bit_processor.run().instrument(current_span.clone()));
 
         //Start the producers
-        let triple_producer = LargeSessionTripleProducer::new(
+        let triple_producer = P::TripleProducer::new(
             BATCH_SIZE_TRIPLES,
             num_triples,
             basic_sessions,
@@ -533,7 +402,7 @@ where
         )?;
         let mut triple_producer_handles = triple_producer.start_triple_production();
 
-        let bit_producer = LargeSessionBitProducer::new(
+        let bit_producer = P::BitProducer::new(
             BATCH_SIZE_BITS,
             num_bits,
             sessions,
@@ -542,10 +411,10 @@ where
         )?;
         let mut bit_producer_handles = bit_producer.start_bit_gen_even_production();
 
-        //Join on the triple producers as they finish before bit producers
+        //Join on the triple producers as they finish before bit producers, raising errors if any
         let mut res_sessions = Vec::new();
-        while let Some(Ok(Ok(session))) = triple_producer_handles.join_next().await {
-            res_sessions.push(session);
+        while let Some(session) = triple_producer_handles.join_next().await {
+            res_sessions.push(session??);
         }
 
         res_sessions.sort_by_key(|session| session.session_id());
@@ -553,7 +422,7 @@ where
         let randomness_session = res_sessions
             .pop()
             .ok_or_else(|| anyhow_error_and_log("Failed to pop a session for randomness"))?;
-        let randomness_producer = LargeSessionRandomProducer::new(
+        let randomness_producer = P::RandomProducer::new(
             num_randomness,
             num_randomness,
             vec![randomness_session],
@@ -562,12 +431,12 @@ where
         )?;
         let mut randomness_producer_handle = randomness_producer.start_random_production();
 
-        //Join on bits and randomness producers
-        while let Some(Ok(Ok(session))) = randomness_producer_handle.join_next().await {
-            res_sessions.push(session);
+        //Join on bits and randomness producers, raising errors if any
+        while let Some(session) = randomness_producer_handle.join_next().await {
+            res_sessions.push(session??);
         }
-        while let Some(Ok(Ok(session))) = bit_producer_handles.join_next().await {
-            res_sessions.push(session);
+        while let Some(session) = bit_producer_handles.join_next().await {
+            res_sessions.push(session??);
         }
 
         res_sessions.sort_by_key(|session| session.session_id());
@@ -578,10 +447,24 @@ where
         let dkg_preproc_return = Arc::into_inner(self.dkg_preproc).ok_or_else(|| {
             anyhow_error_and_log("Error getting hold of dkg preprocessing store inside the Arc")
         })?;
-        let dkg_preproc_return = dkg_preproc_return.into_inner().map_err(|_| {
-            anyhow_error_and_log("Error consuming dkg preprocessing inside the Lock")
-        })?;
+        let dkg_preproc_return = dkg_preproc_return.into_inner();
         Ok((res_sessions, dkg_preproc_return))
+    }
+
+    pub async fn orchestrate_dkg_processing_small_session<
+        P: ProducerFactory<Z, SmallSession<Z>>,
+    >(
+        self,
+        sessions: Vec<SmallSession<Z>>,
+    ) -> anyhow::Result<(Vec<SmallSession<Z>>, Box<dyn DKGPreprocessing<Z>>)> {
+        self.orchestrate_dkg_processing::<_, P>(sessions).await
+    }
+
+    pub async fn orchestrate_dkg_processing_large_session<P: ProducerFactory<Z, LargeSession>>(
+        self,
+        sessions: Vec<LargeSession>,
+    ) -> anyhow::Result<(Vec<LargeSession>, Box<dyn DKGPreprocessing<Z>>)> {
+        self.orchestrate_dkg_processing::<_, P>(sessions).await
     }
 }
 
@@ -589,7 +472,7 @@ where
 fn get_num_correlated_randomness_required(
     params: &DKGParams,
     keyset_config: KeySetConfig,
-    #[cfg(feature = "choreographer")] percentage_offline: usize,
+    #[cfg(feature = "testing")] percentage_offline: usize,
 ) -> (usize, usize, usize) {
     let params_basics_handle = params.get_params_basics_handle();
 
@@ -597,7 +480,7 @@ fn get_num_correlated_randomness_required(
     let num_triples = params_basics_handle.total_triples_required(keyset_config) - num_bits;
     let num_randomness = params_basics_handle.total_randomness_required(keyset_config) - num_bits;
 
-    #[cfg(feature = "choreographer")]
+    #[cfg(feature = "testing")]
     {
         let (num_bits, num_triples, num_randomness) = if percentage_offline < 100 {
             (
@@ -616,7 +499,7 @@ fn get_num_correlated_randomness_required(
         );
         (num_bits, num_triples, num_randomness)
     }
-    #[cfg(not(feature = "choreographer"))]
+    #[cfg(not(feature = "testing"))]
     {
         tracing::info!(
             "About to create {} bits, {} triples and {} randomness",
@@ -632,7 +515,7 @@ fn get_num_correlated_randomness_required(
 fn get_num_tuniform_raw_bits_required(
     params: &DKGParams,
     keyset_config: KeySetConfig,
-    #[cfg(feature = "choreographer")] percentage_offline: usize,
+    #[cfg(feature = "testing")] percentage_offline: usize,
 ) -> (Vec<NoiseInfo>, usize) {
     let mut tuniform_productions = Vec::new();
     let params_basics_handle = params.get_params_basics_handle();
@@ -642,7 +525,12 @@ fn get_num_tuniform_raw_bits_required(
     tuniform_productions.push(params_basics_handle.all_compression_ksk_noise(keyset_config));
 
     match params {
-        DKGParams::WithSnS(sns_params) => tuniform_productions.push(sns_params.all_bk_sns_noise()),
+        DKGParams::WithSnS(sns_params) => {
+            tuniform_productions.push(sns_params.all_bk_sns_noise());
+            if sns_params.sns_compression_params.is_some() {
+                tuniform_productions.push(sns_params.num_needed_noise_sns_compression_key());
+            }
+        }
         DKGParams::WithoutSnS(_) => (),
     }
 
@@ -650,7 +538,7 @@ fn get_num_tuniform_raw_bits_required(
 
     //Required number of _raw_ bits
     let num_bits_required = params_basics_handle.num_raw_bits(keyset_config);
-    #[cfg(feature = "choreographer")]
+    #[cfg(feature = "testing")]
     {
         let num_bits_required = if percentage_offline < 100 {
             for tuniform_production in tuniform_productions.iter_mut() {
@@ -676,7 +564,7 @@ fn get_num_tuniform_raw_bits_required(
         );
         (tuniform_productions, num_bits_required)
     }
-    #[cfg(not(feature = "choreographer"))]
+    #[cfg(not(feature = "testing"))]
     {
         tracing::info!(
             "Bits will be split into {:?}, and {} raw bits.",

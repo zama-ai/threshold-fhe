@@ -4,6 +4,7 @@ pub mod choreography;
 pub mod commitment;
 pub mod execution;
 pub mod file_handling;
+pub mod hashing;
 #[cfg(feature = "non-wasm")]
 pub mod networking;
 pub mod session_id;
@@ -21,9 +22,14 @@ pub mod error;
 pub mod experimental;
 #[cfg(feature = "non-wasm")]
 pub mod grpc;
+#[cfg(any(test, feature = "malicious_strategies"))]
+pub mod malicious_execution;
 #[cfg(feature = "non-wasm")]
 pub mod thread_handles;
 #[cfg(feature = "non-wasm")]
 pub mod tls_certs;
-#[cfg(feature = "non-wasm")]
-pub use conf_trace;
+
+pub trait ProtocolDescription {
+    const INDENT_STRING: &str = "   ";
+    fn protocol_desc(depth: usize) -> String;
+}

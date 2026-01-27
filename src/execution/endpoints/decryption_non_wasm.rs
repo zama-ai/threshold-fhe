@@ -1,40 +1,37 @@
 use crate::algebra::structure_traits::Derive;
 use crate::algebra::structure_traits::Ring;
-#[cfg(any(test, feature = "testing"))]
-use crate::algebra::structure_traits::RingEmbed;
 use crate::algebra::structure_traits::{ErrorCorrect, Invert, Solve};
 use crate::execution::config::BatchParams;
-use crate::execution::large_execution::offline::LargePreprocessing;
-use crate::execution::online::preprocessing::create_memory_factory;
+use crate::execution::constants::B_SWITCH_SQUASH;
+use crate::execution::endpoints::decryption::RadixOrBoolCiphertext;
+use crate::execution::endpoints::decryption::SnsDecryptionKeyType;
+use crate::execution::endpoints::decryption::SnsRadixOrBoolCiphertext;
+use crate::execution::large_execution::offline::SecureLargePreprocessing;
+use crate::execution::online::bit_manipulation::{bit_dec_batch, BatchedBits};
+use crate::execution::online::preprocessing::memory::noiseflood::InMemoryNoiseFloodPreprocessing;
 use crate::execution::online::preprocessing::BitDecPreprocessing;
+use crate::execution::online::preprocessing::InMemoryBitDecPreprocessing;
 use crate::execution::online::preprocessing::NoiseFloodPreprocessing;
-use crate::execution::runtime::party::Identity;
 #[cfg(any(test, feature = "testing"))]
-use crate::execution::runtime::session::BaseSessionStruct;
-use crate::execution::runtime::session::ParameterHandles;
-use crate::execution::runtime::session::SmallSession64;
-use crate::execution::runtime::session::ToBaseSession;
+use crate::execution::runtime::party::Role;
+use crate::execution::runtime::sessions::base_session::BaseSession;
+use crate::execution::runtime::sessions::base_session::ToBaseSession;
+use crate::execution::runtime::sessions::session_parameters::GenericParameterHandles;
+#[cfg(any(test, feature = "testing"))]
+use crate::execution::runtime::sessions::session_parameters::SessionParameters;
+use crate::execution::runtime::sessions::small_session::SmallSessionHandles;
+use crate::execution::sharing::open::{RobustOpen, SecureRobustOpen};
 use crate::execution::sharing::share::Share;
-use crate::execution::small_execution::agree_random::RealAgreeRandom;
-use crate::execution::small_execution::offline::SmallPreprocessing;
+use crate::execution::small_execution::offline::{Preprocessing, SecureSmallPreprocessing};
+use crate::execution::small_execution::prss::PRSSPrimitives;
 use crate::execution::tfhe_internals::parameters::AugmentedCiphertextParameters;
-use crate::execution::tfhe_internals::parameters::Ciphertext128;
-use crate::execution::tfhe_internals::parameters::Ciphertext128Block;
-use crate::execution::tfhe_internals::parameters::Ciphertext64;
-use crate::execution::tfhe_internals::parameters::Ciphertext64Block;
-use crate::execution::tfhe_internals::parameters::LowLevelCiphertext;
-use crate::execution::tfhe_internals::switch_and_squash::SwitchAndSquashKey;
-use crate::execution::{
-    online::bit_manipulation::{bit_dec_batch, BatchedBits},
-    sharing::open::robust_opens_to_all,
-};
 #[cfg(any(test, feature = "testing"))]
 use crate::execution::{
-    runtime::{session::SessionParameters, test_runtime::DistributedTestRuntime},
-    small_execution::prss::PRSSSetup,
+    runtime::test_runtime::DistributedTestRuntime, small_execution::prf::PRSSConversions,
 };
 #[cfg(any(test, feature = "testing"))]
 use crate::session_id::SessionId;
+use crate::thread_handles::spawn_compute_bound;
 use crate::{
     algebra::{
         base_ring::{Z128, Z64},
@@ -44,24 +41,31 @@ use crate::{
     error::error_handler::anyhow_error_and_log,
     execution::{
         constants::{LOG_B_SWITCH_SQUASH, STATSEC},
-        large_execution::offline::{RealLargePreprocessing, TrueDoubleSharing, TrueSingleSharing},
-        runtime::session::{BaseSessionHandles, LargeSession, SmallSession},
+        runtime::sessions::{
+            base_session::BaseSessionHandles, large_session::LargeSession,
+            small_session::SmallSession,
+        },
     },
 };
 #[cfg(any(test, feature = "testing"))]
 use aes_prng::AesRng;
 use anyhow::Context;
 use async_trait::async_trait;
+use itertools::Itertools;
 #[cfg(any(test, feature = "testing"))]
 use rand::SeedableRng;
-use rand::{CryptoRng, Rng};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::num::Wrapping;
 #[cfg(any(test, feature = "testing"))]
+use std::collections::HashSet;
+use std::num::Wrapping;
+use std::ops::Mul;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tfhe::core_crypto::prelude::{keyswitch_lwe_ciphertext, LweCiphertext, LweKeyswitchKey};
-use tfhe::integer::IntegerCiphertext;
+use tfhe::integer::noise_squashing::NoiseSquashingKey;
+use tfhe::integer::ServerKey;
+use tfhe::shortint::ciphertext::SquashedNoiseCiphertext;
 use tfhe::shortint::Ciphertext;
 use tfhe::shortint::PBSOrder;
 #[cfg(any(test, feature = "testing"))]
@@ -69,81 +73,109 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::instrument;
 
+#[cfg(any(test, feature = "testing"))]
 use super::decryption::DecryptionMode;
-use super::keygen::PrivateKeySet;
+use super::decryption::LowLevelCiphertext;
 use super::reconstruct::{combine_decryptions, reconstruct_message};
+use crate::execution::tfhe_internals::private_keysets::PrivateKeySet;
 
-pub struct Small<const EXTENSION_DEGREE: usize>
-where
+// NOTE: This whole trait system for noiseflood preproc is
+// a bit convoluted and could probably be refactored to be simpler.
+pub struct SmallOfflineNoiseFloodSession<
+    const EXTENSION_DEGREE: usize,
+    Ses: SmallSessionHandles<ResiduePoly<Z128, EXTENSION_DEGREE>>,
+> where
     ResiduePoly<Z128, EXTENSION_DEGREE>: Ring,
 {
-    pub session: RefCell<SmallSession<ResiduePoly<Z128, EXTENSION_DEGREE>>>,
+    pub session: RefCell<Ses>,
 }
 
-impl<const EXTENSION_DEGREE: usize> Small<EXTENSION_DEGREE>
-where
-    ResiduePoly<Z128, EXTENSION_DEGREE>: Ring,
-{
-    pub fn new(session: SmallSession<ResiduePoly<Z128, EXTENSION_DEGREE>>) -> Self {
-        Small {
-            session: RefCell::new(session),
-        }
-    }
-}
-
-pub struct Large {
+pub struct LargeOfflineNoiseFloodSession<PreprocStrat> {
     pub session: RefCell<LargeSession>,
+    _marker: std::marker::PhantomData<PreprocStrat>,
 }
 
-impl Large {
-    pub fn new(session: LargeSession) -> Self {
-        Large {
-            session: RefCell::new(session),
-        }
-    }
-}
+pub type SecureNoiseFloodLargeSession<Z> =
+    LargeOfflineNoiseFloodSession<SecureLargePreprocessing<Z>>;
 
 #[async_trait]
-pub trait NoiseFloodPreparation<const EXTENSION_DEGREE: usize> {
+pub trait OfflineNoiseFloodSession<const EXTENSION_DEGREE: usize> {
+    type SessionType: BaseSessionHandles;
     async fn init_prep_noiseflooding(
         &mut self,
         num_ctxt: usize,
-    ) -> anyhow::Result<Box<dyn NoiseFloodPreprocessing<EXTENSION_DEGREE>>>;
+    ) -> anyhow::Result<InMemoryNoiseFloodPreprocessing<EXTENSION_DEGREE>>;
+
+    fn get_mut_base_session(&mut self) -> &mut BaseSession;
+
+    fn new(session: Self::SessionType) -> Self;
 }
 
 #[async_trait]
-impl<const EXTENSION_DEGREE: usize> NoiseFloodPreparation<EXTENSION_DEGREE>
-    for Small<EXTENSION_DEGREE>
+impl<
+        const EXTENSION_DEGREE: usize,
+        Ses: SmallSessionHandles<ResiduePoly<Z128, EXTENSION_DEGREE>> + ToBaseSession,
+    > OfflineNoiseFloodSession<EXTENSION_DEGREE>
+    for SmallOfflineNoiseFloodSession<EXTENSION_DEGREE, Ses>
 where
     ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
-    ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
 {
+    type SessionType = Ses;
+
+    fn new(session: Self::SessionType) -> Self {
+        SmallOfflineNoiseFloodSession {
+            session: RefCell::new(session),
+        }
+    }
+
     /// Load precomputed init data for noise flooding.
     ///
     /// Note: this is actually a synchronous function. It just needs to be async to implement the trait (which is async in the Large case)
-    /// TODO: we should move the slow parts to rayon
     async fn init_prep_noiseflooding(
         &mut self,
         num_ctxt: usize,
-    ) -> anyhow::Result<Box<dyn NoiseFloodPreprocessing<EXTENSION_DEGREE>>> {
+    ) -> anyhow::Result<InMemoryNoiseFloodPreprocessing<EXTENSION_DEGREE>> {
         let session = self.session.get_mut();
-        let mut sns_preprocessing = create_memory_factory().create_noise_flood_preprocessing();
-        sns_preprocessing.fill_from_small_session(session, num_ctxt)?;
+        let mut sns_preprocessing = InMemoryNoiseFloodPreprocessing::default();
+        let own_role = session.my_role();
+
+        let masks = self
+            .session
+            .get_mut()
+            .prss_as_mut()
+            .mask_next_vec(own_role, B_SWITCH_SQUASH, num_ctxt)
+            .await?;
+        sns_preprocessing.append_masks(masks);
         Ok(sns_preprocessing)
+    }
+
+    fn get_mut_base_session(&mut self) -> &mut BaseSession {
+        self.session.get_mut().get_mut_base_session()
     }
 }
 
 #[async_trait]
-impl<const EXTENSION_DEGREE: usize> NoiseFloodPreparation<EXTENSION_DEGREE> for Large
+impl<
+        const EXTENSION_DEGREE: usize,
+        PreprocStrat: Preprocessing<ResiduePoly<Z128, EXTENSION_DEGREE>, LargeSession> + Default,
+    > OfflineNoiseFloodSession<EXTENSION_DEGREE> for LargeOfflineNoiseFloodSession<PreprocStrat>
 where
     ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
-    ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
 {
+    type SessionType = LargeSession;
+
+    fn new(session: Self::SessionType) -> Self {
+        LargeOfflineNoiseFloodSession {
+            session: RefCell::new(session),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// Compute precomputed init data for noise flooding.
     async fn init_prep_noiseflooding(
         &mut self,
         num_ctxt: usize,
-    ) -> anyhow::Result<Box<dyn NoiseFloodPreprocessing<EXTENSION_DEGREE>>> {
+    ) -> anyhow::Result<InMemoryNoiseFloodPreprocessing<EXTENSION_DEGREE>> {
         let session = self.session.get_mut();
         let num_preproc = 2 * num_ctxt * ((STATSEC + LOG_B_SWITCH_SQUASH) as usize + 2);
         let batch_size = BatchParams {
@@ -151,23 +183,102 @@ where
             randoms: num_preproc,
         };
 
-        let mut large_preproc = RealLargePreprocessing::init(
-            session,
-            batch_size,
-            TrueSingleSharing::default(),
-            TrueDoubleSharing::default(),
-        )
-        .await?;
+        let mut correlated_randomness =
+            PreprocStrat::default().execute(session, batch_size).await?;
 
-        let mut sns_preprocessing = create_memory_factory().create_noise_flood_preprocessing();
+        let mut sns_preprocessing = InMemoryNoiseFloodPreprocessing::default();
         sns_preprocessing
             .fill_from_base_preproc(
-                &mut large_preproc,
-                &mut session.to_base_session()?,
+                &mut correlated_randomness,
+                session.get_mut_base_session(),
                 num_ctxt,
             )
             .await?;
         Ok(sns_preprocessing)
+    }
+
+    fn get_mut_base_session(&mut self) -> &mut BaseSession {
+        self.session.get_mut().get_mut_base_session()
+    }
+}
+
+#[async_trait]
+pub trait OnlineNoiseFloodDecryption<const EXTENSION_DEGREE: usize> {
+    async fn decrypt<
+        S: BaseSessionHandles,
+        P: NoiseFloodPreprocessing<EXTENSION_DEGREE> + 'static,
+        T,
+    >(
+        session: &mut S,
+        preprocessing: Arc<Mutex<P>>,
+        keyshares: Arc<PrivateKeySet<EXTENSION_DEGREE>>,
+        ciphertext: Arc<SnsRadixOrBoolCiphertext>,
+        ddec_key_type: SnsDecryptionKeyType,
+    ) -> anyhow::Result<T>
+    where
+        T: tfhe::integer::block_decomposition::Recomposable
+            + tfhe::core_crypto::commons::traits::CastFrom<u128>,
+        ResiduePoly<Z128, EXTENSION_DEGREE>: Invert + Solve + ErrorCorrect;
+}
+
+pub struct SecureOnlineNoiseFloodDecryption;
+
+#[async_trait]
+impl<const EXTENSION_DEGREE: usize> OnlineNoiseFloodDecryption<EXTENSION_DEGREE>
+    for SecureOnlineNoiseFloodDecryption
+{
+    #[instrument(
+        name = "TFHE.Threshold-Dec-1",
+        skip(session, preprocessing, keyshares, ciphertext)
+        fields(sid=?session.session_id(),batch_size=?ciphertext.len())
+    )]
+    async fn decrypt<
+        S: BaseSessionHandles,
+        P: NoiseFloodPreprocessing<EXTENSION_DEGREE> + 'static,
+        T,
+    >(
+        session: &mut S,
+        preprocessing: Arc<Mutex<P>>,
+        keyshares: Arc<PrivateKeySet<EXTENSION_DEGREE>>,
+        ciphertext: Arc<SnsRadixOrBoolCiphertext>,
+        ddec_key_type: SnsDecryptionKeyType,
+    ) -> anyhow::Result<T>
+    where
+        T: tfhe::integer::block_decomposition::Recomposable
+            + tfhe::core_crypto::commons::traits::CastFrom<u128>,
+        ResiduePoly<Z128, EXTENSION_DEGREE>: Invert + Solve + ErrorCorrect,
+    {
+        let shared_masked_ptxts = {
+            let ciphertext = ciphertext.clone();
+            let keyshares = keyshares.clone();
+            let preprocessing = preprocessing.clone();
+
+            spawn_compute_bound(move || -> anyhow::Result<_> {
+                let mut shared_masked_ptxts = Vec::with_capacity(ciphertext.len());
+                for current_ct_block in ciphertext.packed_blocks() {
+                    let partial_decrypt =
+                        partial_decrypt128(&keyshares, current_ct_block, ddec_key_type)?;
+                    let res = partial_decrypt
+                        + preprocessing
+                            .lock()
+                            .map_err(|_| anyhow_error_and_log("Poisoned mutex guard"))?
+                            .next_mask()?;
+
+                    shared_masked_ptxts.push(res);
+                }
+                Ok(shared_masked_ptxts)
+            })
+            .await?
+        }?;
+
+        let partial_decrypted = open_masked_ptxts(session, shared_masked_ptxts, &keyshares).await?;
+        let usable_message_bits =
+            ciphertext.packing_factor() * keyshares.parameters.message_modulus_log() as usize;
+        let shared_partial_decrypt = BlocksPartialDecrypt {
+            bits_in_block: usable_message_bits as u32,
+            partial_decryptions: partial_decrypted,
+        };
+        combine_plaintext_blocks(shared_partial_decrypt)
     }
 }
 
@@ -178,13 +289,11 @@ where
 /// This is the entry point of the decryption protocol.
 ///
 /// # Arguments
-/// * `session` - The session object that contains the networking and the role of the party_keyshare
-/// * `preparation` - The preparation object that contains the decryption `ProtocolType`. `ProtocolType` is the preparation of the noise flooding which holds the `Session` type
+/// * `noiseflood_session` - The preparation object that contains the decryption `ProtocolType`. `ProtocolType` is the preparation of the noise flooding which holds the `Session` type
 /// * `ck` - The conversion key, used for switch&squash
 /// * `ct` - The ciphertext to be decrypted
 /// * `secret_key_share` - The secret key share of the party_keyshare
 /// * `_mode` - The decryption mode. This is used only for tracing purposes
-/// * `_own_identity` - The identity of the party_keyshare. This is used only for tracing purposes
 ///
 /// # Returns
 /// * A tuple containing the results of the decryption and the time it took to execute the decryption
@@ -199,39 +308,57 @@ where
 /// 4. The results are returned
 ///
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(session, preparation, ck, ct, secret_key_share), fields(sid = ?session.session_id(), own_identity = %_own_identity, mode = %_mode))]
-pub async fn decrypt_using_noiseflooding<const EXTENSION_DEGREE: usize, S, P, R, T>(
-    session: &mut S,
-    preparation: &mut P,
-    ck: &SwitchAndSquashKey,
+#[instrument(skip_all, fields(sid, my_role))]
+pub async fn decrypt_using_noiseflooding<const EXTENSION_DEGREE: usize, P, O, T>(
+    noiseflood_session: &mut P,
+    server_key: Arc<ServerKey>,
+    ck: Arc<NoiseSquashingKey>,
     ct: LowLevelCiphertext,
-    secret_key_share: &PrivateKeySet<EXTENSION_DEGREE>,
-    _mode: DecryptionMode,
-    _own_identity: Identity,
+    secret_key_share: Arc<PrivateKeySet<EXTENSION_DEGREE>>,
 ) -> anyhow::Result<(HashMap<String, T>, Duration)>
 where
-    R: Rng + CryptoRng + Send,
-    S: BaseSessionHandles<R>,
-    P: NoiseFloodPreparation<EXTENSION_DEGREE>,
+    P: OfflineNoiseFloodSession<EXTENSION_DEGREE>,
+    O: OnlineNoiseFloodDecryption<EXTENSION_DEGREE>,
     T: tfhe::integer::block_decomposition::Recomposable
         + tfhe::core_crypto::commons::traits::CastFrom<u128>,
-    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect,
+    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
 {
     let execution_start_timer = Instant::now();
+    let ddec_key_type = ct.decryption_key_type();
     let ct_large = match ct {
-        LowLevelCiphertext::Big(ct128) => ct128,
-        LowLevelCiphertext::Small(ct64) => ck.to_large_ciphertext(&ct64)?,
+        LowLevelCiphertext::BigCompressed(ct128) => ct128,
+        LowLevelCiphertext::BigStandard(ct128) => ct128,
+        LowLevelCiphertext::Small(ct64) => match ct64 {
+            RadixOrBoolCiphertext::Radix(base_radix_ciphertext) => SnsRadixOrBoolCiphertext::Radix(
+                spawn_compute_bound(move || {
+                    ck.squash_radix_ciphertext_noise(&server_key, &base_radix_ciphertext)
+                })
+                .await??,
+            ),
+            RadixOrBoolCiphertext::Bool(boolean_block) => SnsRadixOrBoolCiphertext::Bool(
+                spawn_compute_bound(move || {
+                    ck.squash_boolean_block_noise(&server_key, &boolean_block)
+                })
+                .await??,
+            ),
+        },
     };
 
     let mut results = HashMap::with_capacity(1);
     let len = ct_large.len();
-    let mut preprocessing = preparation.init_prep_noiseflooding(len).await?;
-    let preprocessing = preprocessing.as_mut();
-    let outputs = run_decryption_noiseflood::<EXTENSION_DEGREE, _, _, _, T>(
+    let preprocessing = noiseflood_session.init_prep_noiseflooding(len).await?;
+    let session = noiseflood_session.get_mut_base_session();
+    let sid: u128 = session.session_id().into();
+    tracing::Span::current().record("sid", sid);
+    let my_role = session.my_role();
+    tracing::Span::current().record("my_role", my_role.to_string());
+
+    let outputs = O::decrypt::<_, _, T>(
         session,
-        preprocessing,
+        Arc::new(Mutex::new(preprocessing)),
         secret_key_share,
-        ct_large,
+        Arc::new(ct_large),
+        ddec_key_type,
     )
     .await?;
 
@@ -251,16 +378,16 @@ where
 ///
 /// Returns this party's share of the plaintext plus some timing information.
 ///
-/// This is the entry point of the reencryption protocol.
+/// This is the entry point of the User decryption protocol.
 ///
 /// # Arguments
-/// * `session` - The session object that contains the networking and the role of the party_keyshare
-/// * `preparation` - The preparation object that contains the decryption `ProtocolType`. `ProtocolType` is the preparation of the noise flooding which holds the `Session` type
+/// * `parameters` - The parameters object that contains the required session information
+/// * `noiseflood_session` - The preparation object that contains the decryption `ProtocolType`. `ProtocolType` is the preparation of the noise flooding which holds the `Session` type
 /// * `ck` - The conversion key, used for switch&squash
 /// * `ct` - The ciphertext to be decrypted
 /// * `secret_key_share` - The secret key share of the party_keyshare
 /// * `_mode` - The decryption mode. This is used only for tracing purposes
-/// * `_own_identity` - The identity of the party_keyshare. This is used only for tracing purposes
+/// * `_my_role` - The role of the party_keyshare. This is used only for tracing purposes
 ///
 /// # Returns
 /// * A tuple containing the results of the partial decryption and the time it took to execute
@@ -274,52 +401,85 @@ where
 /// 3. The local decryption is executed, without opening the result resulting in a partial decryption
 /// 4. The results are returned
 ///
+/// There is no "online" phase for partial decryption because all computation is local,
+/// that's why there are no traits similar to [OnlineNoiseFloodDecryption].
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-#[instrument(skip(session, preparation, ck, ct, secret_key_share), fields(sid = ?session.session_id(), own_identity = %session.own_identity(), mode = %_mode))]
-pub async fn partial_decrypt_using_noiseflooding<const EXTENSION_DEGREE: usize, S, P, R>(
-    session: &mut S,
-    preparation: &mut P,
-    ck: &SwitchAndSquashKey,
+#[instrument(skip_all, fields(sid, my_role))]
+pub async fn partial_decrypt_using_noiseflooding<const EXTENSION_DEGREE: usize, P>(
+    noiseflood_session: &mut P,
+    server_key: Arc<ServerKey>,
+    ck: Arc<NoiseSquashingKey>,
     ct: LowLevelCiphertext,
     secret_key_share: &PrivateKeySet<EXTENSION_DEGREE>,
-    _mode: DecryptionMode,
 ) -> anyhow::Result<(
     HashMap<String, Vec<ResiduePoly<Z128, EXTENSION_DEGREE>>>,
+    u32,
     Duration,
 )>
 where
-    R: Rng + CryptoRng + Send,
-    S: BaseSessionHandles<R>,
-    P: NoiseFloodPreparation<EXTENSION_DEGREE>,
-    ResiduePoly<Z128, EXTENSION_DEGREE>: Ring,
+    P: OfflineNoiseFloodSession<EXTENSION_DEGREE>,
+    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
 {
-    let execution_start_timer = Instant::now();
-    let ct_large = match ct {
-        LowLevelCiphertext::Big(ct128) => ct128,
-        LowLevelCiphertext::Small(ct64) => ck.to_large_ciphertext(&ct64)?,
+    let sid = {
+        let session = noiseflood_session.get_mut_base_session();
+        let sid: u128 = session.session_id().into();
+        tracing::Span::current().record("sid", sid);
+        let my_role = session.my_role();
+        tracing::Span::current().record("my_role", my_role.to_string());
+        sid
     };
+
+    let execution_start_timer = Instant::now();
+    let ddec_key_type = ct.decryption_key_type();
+    let ct_large = match ct {
+        LowLevelCiphertext::BigCompressed(ct128) => ct128,
+        LowLevelCiphertext::BigStandard(ct128) => ct128,
+        LowLevelCiphertext::Small(ct64) => match ct64 {
+            RadixOrBoolCiphertext::Radix(base_radix_ciphertext) => SnsRadixOrBoolCiphertext::Radix(
+                spawn_compute_bound(move || {
+                    ck.squash_radix_ciphertext_noise(&server_key, &base_radix_ciphertext)
+                })
+                .await??,
+            ),
+            RadixOrBoolCiphertext::Bool(boolean_block) => SnsRadixOrBoolCiphertext::Bool(
+                spawn_compute_bound(move || {
+                    ck.squash_boolean_block_noise(&server_key, &boolean_block)
+                })
+                .await??,
+            ),
+        },
+    };
+    let packing_factor = ct_large.packing_factor();
+    #[cfg(test)]
+    {
+        match &ct_large {
+            SnsRadixOrBoolCiphertext::Radix(_) => {
+                let msg_bits = secret_key_share.parameters.message_modulus_log();
+                let carry_bits = secret_key_share.parameters.carry_modulus_log();
+                assert_eq!(packing_factor as u32, (msg_bits + carry_bits) / msg_bits);
+            }
+            SnsRadixOrBoolCiphertext::Bool(_) => {}
+        }
+    }
+
     let mut results = HashMap::with_capacity(1);
     let len = ct_large.len();
-    let mut preparation = preparation.init_prep_noiseflooding(len).await?;
-    let preparation = preparation.as_mut();
-    let mut shared_masked_ptxts = Vec::with_capacity(ct_large.len());
-    for current_ct_block in &ct_large.inner {
-        let partial_decrypt = partial_decrypt128(secret_key_share, current_ct_block)?;
+    let mut preparation = noiseflood_session.init_prep_noiseflooding(len).await?;
+    let mut shared_masked_ptxts = Vec::with_capacity(len);
+    for current_ct_block in ct_large.packed_blocks() {
+        let partial_decrypt =
+            partial_decrypt128(secret_key_share, current_ct_block, ddec_key_type)?;
         let res = partial_decrypt + preparation.next_mask()?;
 
         shared_masked_ptxts.push(res);
     }
 
-    tracing::info!(
-        "Noiseflood result in session {:?} is ready, got {} blocks",
-        session.session_id(),
-        len
-    );
-    results.insert(format!("{}", session.session_id()), shared_masked_ptxts);
+    tracing::info!("Noiseflood result in session {sid} is ready, got {len} blocks");
+    results.insert(format!("{sid}"), shared_masked_ptxts);
 
     let execution_stop_timer = Instant::now();
     let elapsed_time = execution_stop_timer.duration_since(execution_start_timer);
-    Ok((results, elapsed_time))
+    Ok((results, packing_factor as u32, elapsed_time))
 }
 
 /// Decrypts a ciphertext using bit decomposition.
@@ -334,7 +494,6 @@ where
 /// * `secret_key_share` - The secret key share of the party_keyshare
 /// * `ksk` - The public keyswitch key
 /// * `_mode` - The decryption mode. This is used only for tracing purposes
-/// * `_own_identity` - The identity of the party_keyshare. This is used only for tracing purposes
 ///
 /// # Returns
 /// * A tuple containing the results of the decryption and the time it took to execute the decryption
@@ -348,14 +507,12 @@ where
 /// 3. The results are returned
 ///
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(session, ct, secret_key_share, ksk), fields(session_id = ?session.base_session.parameters.session_id, own_identity = %_own_identity, mode = %_mode))]
-pub async fn decrypt_using_bitdec<const EXTENSION_DEGREE: usize, T>(
+#[instrument(skip_all, fields(session_id = ?session.session_id(), my_role = ?session.my_role()))]
+pub async fn secure_decrypt_using_bitdec<const EXTENSION_DEGREE: usize, T>(
     session: &mut SmallSession<ResiduePoly<Z64, EXTENSION_DEGREE>>,
-    ct: Ciphertext64,
+    ct: &RadixOrBoolCiphertext,
     secret_key_share: &PrivateKeySet<EXTENSION_DEGREE>,
     ksk: &LweKeyswitchKey<Vec<u64>>,
-    _mode: DecryptionMode,
-    _own_identity: Identity,
 ) -> anyhow::Result<(HashMap<String, T>, Duration)>
 where
     T: tfhe::integer::block_decomposition::Recomposable
@@ -366,14 +523,13 @@ where
     let execution_start_timer = Instant::now();
     let mut results = HashMap::with_capacity(1);
 
-    let sid = session.base_session.parameters.session_id;
+    let sid = session.session_id();
 
-    let mut preparation = init_prep_bitdec_small(session, ct.blocks().len()).await?;
+    let mut preparation = secure_init_prep_bitdec_small_session(session, ct.len()).await?;
 
-    let preparation = preparation.as_mut();
-    let outputs = run_decryption_bitdec::<EXTENSION_DEGREE, _, _, _, T>(
+    let outputs = run_decryption_bitdec::<EXTENSION_DEGREE, _, _, T>(
         session,
-        preparation,
+        &mut preparation,
         secret_key_share,
         ksk,
         ct,
@@ -381,7 +537,7 @@ where
     .await?;
 
     tracing::info!("Bitdec result in session {:?} is ready", sid);
-    results.insert(format!("{}", sid), outputs);
+    results.insert(format!("{sid}"), outputs);
 
     let execution_stop_timer = Instant::now();
     let elapsed_time = execution_stop_timer.duration_since(execution_start_timer);
@@ -393,7 +549,7 @@ where
 ///
 /// Returns this party's share of the plaintext plus some timing information.
 ///
-/// This is the entry point of the reencryption protocol.
+/// This is the entry point of the User decryption protocol.
 ///
 /// # Arguments
 /// * `session` - The session object that contains the networking and the role of the party_keyshare
@@ -401,7 +557,7 @@ where
 /// * `secret_key_share` - The secret key share of the party_keyshare
 /// * `ksk` - The public keyswitch key
 /// * `_mode` - The decryption mode. This is used only for tracing purposes
-/// * `_own_identity` - The identity of the party_keyshare. This is used only for tracing purposes
+/// * `_my_role` - The role of the party_keyshare. This is used only for tracing purposes
 ///
 /// # Returns
 /// * A tuple containing the results of the partial decryption and the time it took to execute
@@ -415,13 +571,12 @@ where
 /// 4. The results are returned
 ///
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-#[instrument(skip(session, ct, secret_key_share, ksk), fields(session_id = ?session.base_session.parameters.session_id, own_identity = ?session.base_session.parameters.own_identity, mode = %_mode))]
-pub async fn partial_decrypt_using_bitdec<const EXTENSION_DEGREE: usize>(
+#[instrument(skip_all, fields(session_id = ?session.session_id(), my_role = ?session.my_role()))]
+pub async fn secure_partial_decrypt_using_bitdec<const EXTENSION_DEGREE: usize>(
     session: &mut SmallSession<ResiduePoly<Z64, EXTENSION_DEGREE>>,
-    ct: Ciphertext64,
+    ct: &RadixOrBoolCiphertext,
     secret_key_share: &PrivateKeySet<EXTENSION_DEGREE>,
     ksk: &LweKeyswitchKey<Vec<u64>>,
-    _mode: DecryptionMode,
 ) -> anyhow::Result<(
     HashMap<String, Vec<ResiduePoly<Z64, EXTENSION_DEGREE>>>,
     Duration,
@@ -431,23 +586,22 @@ where
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
 {
     let execution_start_timer = Instant::now();
-    let sid = session.base_session.parameters.session_id;
-    let own_role = session.my_role()?;
-    let mut prep = init_prep_bitdec_small(session, ct.blocks().len()).await?;
-    let prep = prep.as_mut();
+    let sid = session.session_id();
+    let own_role = session.my_role();
+    let mut prep = secure_init_prep_bitdec_small_session(session, ct.len()).await?;
 
     let mut results = HashMap::with_capacity(1);
 
-    let mut pdec_blocks = Vec::with_capacity(ct.blocks().len());
+    let mut pdec_blocks = Vec::with_capacity(ct.len());
     for current_ct_block in ct.blocks() {
         let partial_dec = partial_decrypt64(secret_key_share, ksk, current_ct_block)?;
         pdec_blocks.push(Share::new(own_role, partial_dec));
     }
 
     // bit decomposition
-    let bits = bit_dec_batch::<Z64, EXTENSION_DEGREE, _, _, _>(
+    let bits = bit_dec_batch::<Z64, EXTENSION_DEGREE, _, _>(
         &mut session.base_session,
-        prep,
+        &mut prep,
         pdec_blocks,
     )
     .await?;
@@ -455,11 +609,11 @@ where
     let total_bits = secret_key_share.parameters.total_block_bits() as usize;
 
     // bit-compose the plaintexts
-    let ptxt_sums = BatchedBits::extract_ptxts(bits, total_bits, prep, session).await?;
+    let ptxt_sums = BatchedBits::extract_ptxts(bits, total_bits, &mut prep, session).await?;
     let ptxt_sums: Vec<_> = ptxt_sums.iter().map(|ptxt_sum| ptxt_sum.value()).collect();
 
     tracing::info!("Bitdec result in session {:?} is ready", sid);
-    results.insert(format!("{}", sid), ptxt_sums);
+    results.insert(format!("{sid}"), ptxt_sums);
 
     let execution_stop_timer = Instant::now();
     let elapsed_time = execution_stop_timer.duration_since(execution_start_timer);
@@ -500,59 +654,60 @@ where
 }
 
 #[cfg(any(test, feature = "testing"))]
-async fn setup_small_session<Z>(
-    mut base_session: BaseSessionStruct<AesRng, SessionParameters>,
-) -> SmallSession<Z>
+async fn setup_small_session<Z>(mut base_session: BaseSession) -> SmallSession<Z>
 where
-    Z: Ring,
-    Z: RingEmbed,
+    Z: ErrorCorrect,
     Z: Invert,
+    Z: PRSSConversions,
 {
-    use crate::execution::runtime::session::{ParameterHandles, SmallSessionStruct};
+    use crate::execution::{
+        runtime::sessions::{
+            session_parameters::GenericParameterHandles, small_session::SmallSession,
+        },
+        small_execution::prss::{AbortSecurePrssInit, DerivePRSSState, PRSSInit},
+    };
     let session_id = base_session.session_id();
 
-    let prss_setup =
-        PRSSSetup::<Z>::init_with_abort::<RealAgreeRandom, AesRng, _>(&mut base_session)
-            .await
-            .unwrap();
-    SmallSessionStruct::new_from_prss_state(
-        base_session,
-        prss_setup.new_prss_session_state(session_id),
-    )
-    .unwrap()
+    let prss_setup = AbortSecurePrssInit::default()
+        .init(&mut base_session)
+        .await
+        .unwrap();
+    SmallSession::new_from_prss_state(base_session, prss_setup.new_prss_session_state(session_id))
+        .unwrap()
 }
 
-/// compute preprocessing information for a bit-decomposition decryption for the given session and number of ciphertexts for the nSmall protocol variant.
+/// Generically compute preprocessing information for a bit-decomposition decryption for the given session and number of ciphertexts.
 #[instrument(
 name = "TFHE.Threshold-Dec-2.Preprocessing",
 skip_all,
 fields(batch_size=?num_ctxts)
 )]
-pub async fn init_prep_bitdec_small<const EXTENSION_DEGREE: usize>(
-    session: &mut SmallSession64<EXTENSION_DEGREE>,
+pub async fn init_prep_bitdec<
+    const EXTENSION_DEGREE: usize,
+    Sess: BaseSessionHandles + ToBaseSession,
+    PreprocStrat: Preprocessing<ResiduePoly<Z64, EXTENSION_DEGREE>, Sess> + Default,
+>(
+    session: &mut Sess,
     num_ctxts: usize,
-) -> anyhow::Result<Box<dyn BitDecPreprocessing<EXTENSION_DEGREE>>>
+) -> anyhow::Result<InMemoryBitDecPreprocessing<EXTENSION_DEGREE>>
 where
-    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
 {
-    let mut bitdec_preprocessing = create_memory_factory().create_bit_decryption_preprocessing();
+    let mut bitdec_preprocessing = InMemoryBitDecPreprocessing::default();
     let bitdec_batch = BatchParams {
         triples: bitdec_preprocessing.num_required_triples(num_ctxts)
             + bitdec_preprocessing.num_required_bits(num_ctxts),
         randoms: bitdec_preprocessing.num_required_bits(num_ctxts),
     };
 
-    let mut small_preprocessing = SmallPreprocessing::<
-        ResiduePoly<Z64, EXTENSION_DEGREE>,
-        RealAgreeRandom,
-    >::init(session, bitdec_batch)
-    .await?;
+    let mut correlated_randomness = PreprocStrat::default()
+        .execute(session, bitdec_batch)
+        .await?;
 
     bitdec_preprocessing
         .fill_from_base_preproc(
-            &mut small_preprocessing,
-            &mut session.to_base_session()?,
+            &mut correlated_randomness,
+            session.get_mut_base_session(),
             num_ctxts,
         )
         .await?;
@@ -560,68 +715,75 @@ where
     Ok(bitdec_preprocessing)
 }
 
-/// compute preprocessing information for a bit-decomposition decryption for the given session and number of ciphertexts for the nLarge protocol variant.
-#[instrument(
-name = "TFHE.Threshold-Dec-2.Preprocessing",
-skip_all,
-fields(batch_size=?num_ctxts)
-)]
-pub async fn init_prep_bitdec_large<const EXTENSION_DEGREE: usize>(
+/// Wrapper around [`init_prep_bitdec`] for small sessions that uses the secure small preprocessing strategy.
+pub async fn secure_init_prep_bitdec_small_session<const EXTENSION_DEGREE: usize>(
+    session: &mut SmallSession<ResiduePoly<Z64, EXTENSION_DEGREE>>,
+    num_ctxts: usize,
+) -> anyhow::Result<InMemoryBitDecPreprocessing<EXTENSION_DEGREE>>
+where
+    ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
+{
+    init_prep_bitdec::<EXTENSION_DEGREE, _, SecureSmallPreprocessing>(session, num_ctxts).await
+}
+
+/// Wrapper around [`init_prep_bitdec`] for large sessions that uses the secure large preprocessing strategy.
+pub async fn secure_init_prep_bitdec_large_session<const EXTENSION_DEGREE: usize>(
     session: &mut LargeSession,
     num_ctxts: usize,
-) -> anyhow::Result<Box<dyn BitDecPreprocessing<EXTENSION_DEGREE>>>
+) -> anyhow::Result<InMemoryBitDecPreprocessing<EXTENSION_DEGREE>>
 where
-    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve,
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
 {
-    let mut bitdec_preprocessing = create_memory_factory().create_bit_decryption_preprocessing();
-    let bitdec_batch = BatchParams {
-        triples: bitdec_preprocessing.num_required_triples(num_ctxts)
-            + bitdec_preprocessing.num_required_bits(num_ctxts),
-        randoms: bitdec_preprocessing.num_required_bits(num_ctxts),
-    };
-
-    let mut large_preprocessing = LargePreprocessing::<
-        ResiduePoly<Z64, EXTENSION_DEGREE>,
-        TrueSingleSharing<ResiduePoly<Z64, EXTENSION_DEGREE>>,
-        TrueDoubleSharing<ResiduePoly<Z64, EXTENSION_DEGREE>>,
-    >::init(
-        session,
-        bitdec_batch,
-        TrueSingleSharing::default(),
-        TrueDoubleSharing::default(),
-    )
-    .await?;
-
-    bitdec_preprocessing
-        .fill_from_base_preproc(
-            &mut large_preprocessing,
-            &mut session.to_base_session()?,
-            num_ctxts,
-        )
-        .await?;
-
-    Ok(bitdec_preprocessing)
+    init_prep_bitdec::<
+        EXTENSION_DEGREE,
+        _,
+        SecureLargePreprocessing<ResiduePoly<Z64, EXTENSION_DEGREE>>,
+    >(session, num_ctxts)
+    .await
 }
 
-/// test the threshold decryption for a given 64-bit TFHE-rs ciphertext
+#[cfg(any(test, feature = "testing"))]
+pub async fn threshold_decrypt64<Z: Ring, const EXTENSION_DEGREE: usize>(
+    runtime: &DistributedTestRuntime<Z, Role, EXTENSION_DEGREE>,
+    ct: &RadixOrBoolCiphertext,
+    mode: DecryptionMode,
+) -> anyhow::Result<HashMap<Role, Z64>>
+where
+    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
+    ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
+{
+    threshold_decrypt64_maybe_malicious::<Z, SecureOnlineNoiseFloodDecryption, EXTENSION_DEGREE>(
+        runtime,
+        ct,
+        mode,
+        HashSet::new(),
+    )
+    .await
+}
+
+/// Test the threshold decryption for a given 64-bit TFHE-rs ciphertext
 ///
 /// NOTE: Trait bounds are a bit odd here because this function does a bit too many things
 /// at once
+///
+/// The malicious set is a list of party indices (starting at 0)
+/// that will run (potentially) decryption protocol defined by the MalDec trait.
 #[cfg(any(test, feature = "testing"))]
-pub fn threshold_decrypt64<Z: Ring, const EXTENSION_DEGREE: usize>(
-    runtime: &DistributedTestRuntime<Z, EXTENSION_DEGREE>,
-    ct: &Ciphertext64,
+async fn threshold_decrypt64_maybe_malicious<
+    Z: Ring,
+    MalDec: OnlineNoiseFloodDecryption<EXTENSION_DEGREE>,
+    const EXTENSION_DEGREE: usize,
+>(
+    runtime: &DistributedTestRuntime<Z, Role, EXTENSION_DEGREE>,
+    ct: &RadixOrBoolCiphertext,
     mode: DecryptionMode,
-) -> anyhow::Result<HashMap<Identity, Z64>>
+    malicious_set: HashSet<Role>,
+) -> anyhow::Result<HashMap<Role, Z64>>
 where
     ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
 {
     let session_id = SessionId::new(ct)?;
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let _guard = rt.enter();
 
     let mut set = JoinSet::new();
 
@@ -629,104 +791,153 @@ where
     let large_ct = match mode {
         DecryptionMode::NoiseFloodSmall | DecryptionMode::NoiseFloodLarge => {
             tracing::info!("Switch&Squash started...");
-            let keyset_ck = runtime.get_conversion_key();
-            let large_ct = keyset_ck.to_large_ciphertext(ct)?;
+            let server_key = runtime.get_server_key();
+            let int_server_key: &tfhe::integer::ServerKey = server_key.as_ref().as_ref();
+            let sns_key = server_key.noise_squashing_key().unwrap();
+            let large_ct = match ct {
+                RadixOrBoolCiphertext::Radix(ct) => SnsRadixOrBoolCiphertext::Radix(
+                    sns_key.squash_radix_ciphertext_noise(int_server_key, ct)?,
+                ),
+                RadixOrBoolCiphertext::Bool(boolean_block) => SnsRadixOrBoolCiphertext::Bool(
+                    sns_key.squash_boolean_block_noise(int_server_key, boolean_block)?,
+                ),
+            };
             tracing::info!("Switch&Squash done.");
             Some(large_ct)
         }
         _ => None,
     };
 
-    for (index_id, identity) in runtime.identities.clone().into_iter().enumerate() {
-        let role_assignments = runtime.role_assignments.clone();
-        let net = Arc::clone(&runtime.user_nets[index_id]);
+    for role in runtime.roles.clone().into_iter() {
+        let roles = runtime.roles.clone();
+        let net = runtime.user_nets[&role].clone();
         let threshold = runtime.threshold;
+        let ct = ct.clone();
+        let malicious_set = malicious_set.clone();
 
         let party_keyshare = runtime
             .keyshares
             .clone()
-            .map(|ks| ks[index_id].clone())
+            .map(|ks| ks[role.one_based() - 1].clone())
             .ok_or_else(|| {
                 anyhow_error_and_log("key share not set during decryption".to_string())
             })?;
 
-        let ct = ct.clone();
         let large_ct = large_ct.clone();
 
         tracing::info!(
-            "{}: starting threshold decrypt with mode {}",
-            identity,
+            "party {}: starting threshold decrypt with mode {}",
+            role,
             mode
         );
 
-        let session_params =
-            SessionParameters::new(threshold, session_id, identity.clone(), role_assignments)
-                .unwrap();
-        let base_session =
-            BaseSessionStruct::new(session_params, net, AesRng::from_entropy()).unwrap();
+        let session_params = SessionParameters::new(threshold, session_id, role, roles).unwrap();
+        let base_session = BaseSession::new(session_params, net, AesRng::from_entropy()).unwrap();
 
         match mode {
             DecryptionMode::NoiseFloodSmall => {
                 let large_ct = large_ct.unwrap();
                 set.spawn(async move {
-                    let mut session =
+                    let session =
                         setup_small_session::<ResiduePoly<Z128, EXTENSION_DEGREE>>(base_session)
                             .await;
 
-                    let mut noiseflood_preprocessing = Small::new(session.clone())
-                        .init_prep_noiseflooding(ct.blocks().len())
+                    let mut session_noiseflood = SmallOfflineNoiseFloodSession::new(session);
+                    let noiseflood_preprocessing = session_noiseflood
+                        .init_prep_noiseflooding(ct.len())
                         .await
                         .unwrap();
-                    let out = run_decryption_noiseflood_64(
-                        &mut session,
-                        noiseflood_preprocessing.as_mut(),
-                        &party_keyshare,
-                        large_ct,
-                    )
-                    .await
-                    .unwrap();
+                    let out = if malicious_set.contains(&role) {
+                        run_decryption_noiseflood_64::<EXTENSION_DEGREE, _, _, MalDec>(
+                            session_noiseflood.session.get_mut(),
+                            Arc::new(Mutex::new(noiseflood_preprocessing)),
+                            Arc::new(party_keyshare),
+                            Arc::new(large_ct),
+                            SnsDecryptionKeyType::SnsKey,
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        run_decryption_noiseflood_64::<
+                            EXTENSION_DEGREE,
+                            _,
+                            _,
+                            SecureOnlineNoiseFloodDecryption,
+                        >(
+                            session_noiseflood.session.get_mut(),
+                            Arc::new(Mutex::new(noiseflood_preprocessing)),
+                            Arc::new(party_keyshare),
+                            Arc::new(large_ct),
+                            SnsDecryptionKeyType::SnsKey,
+                        )
+                        .await
+                        .unwrap()
+                    };
 
-                    (identity, out)
+                    (role, out)
                 });
             }
             DecryptionMode::NoiseFloodLarge => {
                 let large_ct = large_ct.unwrap();
                 set.spawn(async move {
-                    let mut session = LargeSession::new(base_session);
-                    let mut noiseflood_preprocessing = Large::new(session.clone())
-                        .init_prep_noiseflooding(ct.blocks().len())
+                    let session = LargeSession::new(base_session);
+                    let mut session_noiseflood = SecureNoiseFloodLargeSession::new(session);
+                    let noiseflood_preprocessing = session_noiseflood
+                        .init_prep_noiseflooding(ct.len())
                         .await
                         .unwrap();
-                    let out = run_decryption_noiseflood_64(
-                        &mut session,
-                        noiseflood_preprocessing.as_mut(),
-                        &party_keyshare,
-                        large_ct,
-                    )
-                    .await
-                    .unwrap();
+                    let out = if malicious_set.contains(&role) {
+                        run_decryption_noiseflood_64::<EXTENSION_DEGREE, _, _, MalDec>(
+                            session_noiseflood.session.get_mut(),
+                            Arc::new(Mutex::new(noiseflood_preprocessing)),
+                            Arc::new(party_keyshare),
+                            Arc::new(large_ct),
+                            SnsDecryptionKeyType::SnsKey,
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        run_decryption_noiseflood_64::<
+                            EXTENSION_DEGREE,
+                            _,
+                            _,
+                            SecureOnlineNoiseFloodDecryption,
+                        >(
+                            session_noiseflood.session.get_mut(),
+                            Arc::new(Mutex::new(noiseflood_preprocessing)),
+                            Arc::new(party_keyshare),
+                            Arc::new(large_ct),
+                            SnsDecryptionKeyType::SnsKey,
+                        )
+                        .await
+                        .unwrap()
+                    };
 
-                    (identity, out)
+                    (role, out)
                 });
             }
             DecryptionMode::BitDecLarge => {
                 let ks_key = runtime.get_ks_key();
                 set.spawn(async move {
                     let mut session = LargeSession::new(base_session);
-                    let mut prep = init_prep_bitdec_large(&mut session, ct.blocks().len())
+                    let mut prep = secure_init_prep_bitdec_large_session(&mut session, ct.len())
                         .await
                         .unwrap();
-                    let out = run_decryption_bitdec_64(
-                        &mut session,
-                        prep.as_mut(),
-                        &party_keyshare,
-                        &ks_key,
-                        ct,
-                    )
-                    .await
-                    .unwrap();
+                    let out = if malicious_set.contains(&role) {
+                        unimplemented!("malicious unimplemented")
+                    } else {
+                        run_decryption_bitdec_64(
+                            &mut session,
+                            &mut prep,
+                            &party_keyshare,
+                            &ks_key,
+                            &ct,
+                        )
+                        .await
+                        .unwrap()
+                    };
 
-                    (identity, out)
+                    (role, out)
                 });
             }
             DecryptionMode::BitDecSmall => {
@@ -735,40 +946,38 @@ where
                     let mut session =
                         setup_small_session::<ResiduePoly<Z64, EXTENSION_DEGREE>>(base_session)
                             .await;
-                    let mut prep = init_prep_bitdec_small(&mut session, ct.blocks().len())
+                    let mut prep = secure_init_prep_bitdec_small_session(&mut session, ct.len())
                         .await
                         .unwrap();
-                    let out = run_decryption_bitdec_64(
-                        &mut session,
-                        prep.as_mut(),
-                        &party_keyshare,
-                        &ks_key,
-                        ct,
-                    )
-                    .await
-                    .unwrap();
-                    (identity, out)
+                    let out = if malicious_set.contains(&role) {
+                        unimplemented!("malicious unimplemented")
+                    } else {
+                        run_decryption_bitdec_64(
+                            &mut session,
+                            &mut prep,
+                            &party_keyshare,
+                            &ks_key,
+                            &ct,
+                        )
+                        .await
+                        .unwrap()
+                    };
+                    (role, out)
                 });
             }
         }
     }
 
-    let results = rt.block_on(async {
-        let mut results = HashMap::new();
-        while let Some(v) = set.join_next().await {
-            let (identity, val) = v.unwrap();
-            results.insert(identity, val);
-        }
-        results
-    });
+    let mut results = HashMap::new();
+    while let Some(v) = set.join_next().await {
+        let (role, val) = v.unwrap();
+        results.insert(role, val);
+    }
+
     Ok(results)
 }
 
-async fn open_masked_ptxts<
-    const EXTENSION_DEGREE: usize,
-    R: Rng + CryptoRng,
-    S: BaseSessionHandles<R>,
->(
+async fn open_masked_ptxts<const EXTENSION_DEGREE: usize, S: BaseSessionHandles>(
     session: &S,
     res: Vec<ResiduePoly<Z128, EXTENSION_DEGREE>>,
     keyshares: &PrivateKeySet<EXTENSION_DEGREE>,
@@ -776,24 +985,24 @@ async fn open_masked_ptxts<
 where
     ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    let openeds = robust_opens_to_all(session, &res, session.threshold() as usize).await?;
+    let openeds = SecureRobustOpen::default()
+        .robust_open_list_to_all(session, res, session.threshold() as usize)
+        .await?;
     reconstruct_message(openeds, &keyshares.parameters)
 }
 
-async fn open_bit_composed_ptxts<
-    const EXTENSION_DEGREE: usize,
-    R: Rng + CryptoRng,
-    S: BaseSessionHandles<R>,
->(
+async fn open_bit_composed_ptxts<const EXTENSION_DEGREE: usize, S: BaseSessionHandles>(
     session: &S,
     res: Vec<ResiduePoly<Z64, EXTENSION_DEGREE>>,
 ) -> anyhow::Result<Vec<Z64>>
 where
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    let openeds = robust_opens_to_all(session, &res, session.threshold() as usize).await?;
-
     let mut out = Vec::with_capacity(res.len());
+    let openeds = SecureRobustOpen::default()
+        .robust_open_list_to_all(session, res, session.threshold() as usize)
+        .await?;
+
     match openeds {
         Some(openeds) => {
             for opened in openeds {
@@ -810,79 +1019,36 @@ where
     Ok(out)
 }
 
-#[instrument(
-    name = "TFHE.Threshold-Dec-1",
-    skip(session, preprocessing, keyshares, ciphertext)
-    fields(sid=?session.session_id(),batch_size=?ciphertext.len())
-)]
-pub async fn run_decryption_noiseflood<
-    const EXTENSION_DEGREE: usize,
-    R: Rng + CryptoRng,
-    S: BaseSessionHandles<R>,
-    P: NoiseFloodPreprocessing<EXTENSION_DEGREE> + ?Sized,
-    T,
->(
-    session: &mut S,
-    preprocessing: &mut P,
-    keyshares: &PrivateKeySet<EXTENSION_DEGREE>,
-    ciphertext: Ciphertext128,
-) -> anyhow::Result<T>
-where
-    T: tfhe::integer::block_decomposition::Recomposable
-        + tfhe::core_crypto::commons::traits::CastFrom<u128>,
-    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect,
-{
-    let mut shared_masked_ptxts = Vec::with_capacity(ciphertext.len());
-    for current_ct_block in ciphertext.inner {
-        let partial_decrypt = partial_decrypt128(keyshares, &current_ct_block)?;
-        let res = partial_decrypt + preprocessing.next_mask()?;
-
-        shared_masked_ptxts.push(res);
-    }
-    let partial_decrypted = open_masked_ptxts(session, shared_masked_ptxts, keyshares).await?;
-    let usable_message_bits = keyshares.parameters.message_modulus_log() as usize;
-    let shared_partial_decrypt = BlocksPartialDecrypt {
-        bits_in_block: usable_message_bits as u32,
-        partial_decryptions: partial_decrypted,
-    };
-    combine_plaintext_blocks(shared_partial_decrypt)
-}
-
 pub async fn run_decryption_noiseflood_64<
     const EXTENSION_DEGREE: usize,
-    R: Rng + CryptoRng,
-    S: BaseSessionHandles<R>,
-    P: NoiseFloodPreprocessing<EXTENSION_DEGREE> + ?Sized,
+    S: BaseSessionHandles,
+    P: NoiseFloodPreprocessing<EXTENSION_DEGREE> + 'static,
+    O: OnlineNoiseFloodDecryption<EXTENSION_DEGREE>,
 >(
     session: &mut S,
-    preprocessing: &mut P,
-    keyshares: &PrivateKeySet<EXTENSION_DEGREE>,
-    ciphertext: Ciphertext128,
+    preprocessing: Arc<Mutex<P>>,
+    keyshares: Arc<PrivateKeySet<EXTENSION_DEGREE>>,
+    ciphertext: Arc<SnsRadixOrBoolCiphertext>,
+    ddec_key_type: SnsDecryptionKeyType,
 ) -> anyhow::Result<Z64>
 where
-    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect,
+    ResiduePoly<Z128, EXTENSION_DEGREE>: Invert + Solve + ErrorCorrect,
 {
-    let res = run_decryption_noiseflood::<EXTENSION_DEGREE, _, _, _, u64>(
-        session,
-        preprocessing,
-        keyshares,
-        ciphertext,
-    )
-    .await?;
+    let res = O::decrypt::<_, _, u64>(session, preprocessing, keyshares, ciphertext, ddec_key_type)
+        .await?;
     Ok(Wrapping(res))
 }
 
 pub async fn run_decryption_bitdec_64<
     const EXTENSION_DEGREE: usize,
     P: BitDecPreprocessing<EXTENSION_DEGREE> + Send + ?Sized,
-    Rnd: Rng + CryptoRng,
-    Ses: BaseSessionHandles<Rnd>,
+    Ses: BaseSessionHandles,
 >(
     session: &mut Ses,
     prep: &mut P,
     keyshares: &PrivateKeySet<EXTENSION_DEGREE>,
     ksk: &LweKeyswitchKey<Vec<u64>>,
-    ciphertext: Ciphertext64,
+    ciphertext: &RadixOrBoolCiphertext,
 ) -> anyhow::Result<Z64>
 where
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Solve,
@@ -890,39 +1056,39 @@ where
     let res = run_decryption_bitdec(session, prep, keyshares, ksk, ciphertext).await?;
     Ok(Wrapping(res))
 }
+
 // run decryption with bit-decomposition
 #[instrument(
     name = "TFHE.Threshold-Dec-2",
     skip(session, prep, keyshares, ksk, ciphertext),
-    fields(sid=?session.session_id(),batch_size=?ciphertext.blocks().len())
+    fields(sid=?session.session_id(),batch_size=?ciphertext.len())
 )]
 pub async fn run_decryption_bitdec<
     const EXTENSION_DEGREE: usize,
     P: BitDecPreprocessing<EXTENSION_DEGREE> + Send + ?Sized,
-    Rnd: Rng + CryptoRng,
-    Ses: BaseSessionHandles<Rnd>,
+    Ses: BaseSessionHandles,
     T,
 >(
     session: &mut Ses,
     prep: &mut P,
     keyshares: &PrivateKeySet<EXTENSION_DEGREE>,
     ksk: &LweKeyswitchKey<Vec<u64>>,
-    ciphertext: Ciphertext64,
+    ciphertext: &RadixOrBoolCiphertext,
 ) -> anyhow::Result<T>
 where
     T: tfhe::integer::block_decomposition::Recomposable
         + tfhe::core_crypto::commons::traits::CastFrom<u128>,
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Solve,
 {
-    let own_role = session.my_role()?;
+    let own_role = session.my_role();
 
-    let mut shared_ptxts = Vec::with_capacity(ciphertext.blocks().len());
+    let mut shared_ptxts = Vec::with_capacity(ciphertext.len());
     for current_ct_block in ciphertext.blocks() {
         let partial_dec = partial_decrypt64(keyshares, ksk, current_ct_block)?;
         shared_ptxts.push(Share::new(own_role, partial_dec));
     }
 
-    let bits = bit_dec_batch::<Z64, EXTENSION_DEGREE, P, _, _>(session, prep, shared_ptxts).await?;
+    let bits = bit_dec_batch::<Z64, EXTENSION_DEGREE, P, _>(session, prep, shared_ptxts).await?;
 
     let total_bits = keyshares.parameters.total_block_bits() as usize;
 
@@ -976,8 +1142,7 @@ pub struct BlockPartialDecrypt {
 pub async fn task_decryption_bitdec_par<
     const EXTENSION_DEGREE: usize,
     P: BitDecPreprocessing<EXTENSION_DEGREE> + Send,
-    Rnd: Rng + CryptoRng,
-    Ses: BaseSessionHandles<Rnd>,
+    Ses: BaseSessionHandles,
     T,
 >(
     session: &mut Ses,
@@ -991,21 +1156,25 @@ where
         + tfhe::core_crypto::commons::traits::CastFrom<u128>,
     ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Solve,
 {
-    let role = session.my_role()?;
+    let role = session.my_role();
     // This vec will be joined on "main" task and all results recombined there
     let mut vec_partial_decryptions = Vec::new();
-    for (block, preprocessing) in ciphertexts.iter().zip(preprocessings.iter_mut()) {
+    if ciphertexts.len() != preprocessings.len() {
+        return Err(anyhow_error_and_log(format!(
+            "Expected {} preprocessings, got {}",
+            ciphertexts.len(),
+            preprocessings.len()
+        )));
+    }
+    for (block, preprocessing) in ciphertexts.iter().zip_eq(preprocessings.iter_mut()) {
         //We create a batch of size 1
         let partial_decrypt = vec![Share::new(
             role,
             partial_decrypt64(keyshares, ksk, block).unwrap(),
         )];
-        let bits = bit_dec_batch::<Z64, EXTENSION_DEGREE, _, _, _>(
-            session,
-            preprocessing,
-            partial_decrypt,
-        )
-        .await?;
+        let bits =
+            bit_dec_batch::<Z64, EXTENSION_DEGREE, _, _>(session, preprocessing, partial_decrypt)
+                .await?;
 
         let total_bits = keyshares.parameters.total_block_bits() as usize;
 
@@ -1039,27 +1208,41 @@ where
 /// computes b - <a, s> with no rounding of the noise. This is used for noise flooding decryption
 pub fn partial_decrypt128<const EXTENSION_DEGREE: usize>(
     sk_share: &PrivateKeySet<EXTENSION_DEGREE>,
-    ct: &Ciphertext128Block,
+    ct: &SquashedNoiseCiphertext,
+    ddec_key_type: SnsDecryptionKeyType,
 ) -> anyhow::Result<ResiduePoly<Z128, EXTENSION_DEGREE>>
 where
-    ResiduePoly<Z128, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    let sns_secret_key = match &sk_share.glwe_secret_key_share_sns_as_lwe {
-        Some(key) => key.data_as_raw_vec(),
-        None => {
-            return Err(anyhow_error_and_log(
-                "Missing the switch and squash secret key".to_string(),
-            ))
+    let sns_secret_key = match ddec_key_type {
+        SnsDecryptionKeyType::SnsKey => match &sk_share.glwe_secret_key_share_sns_as_lwe {
+            Some(key) => key.data_as_raw_iter(),
+            None => {
+                return Err(anyhow_error_and_log(
+                    "Missing the switch and squash secret key".to_string(),
+                ))
+            }
+        },
+        SnsDecryptionKeyType::SnsCompressionKey => {
+            match &sk_share.glwe_sns_compression_key_as_lwe {
+                Some(key) => key.data_as_raw_iter(),
+                None => {
+                    return Err(anyhow_error_and_log(
+                        "Missing the switch and squash compression secret key".to_string(),
+                    ))
+                }
+            }
         }
     };
+    let ct = ct.lwe_ciphertext();
     let (mask, body) = ct.get_mask_and_body();
-    let a_time_s = (0..sns_secret_key.len()).fold(
+
+    let a_time_s = (sns_secret_key.zip_eq(mask.as_ref())).fold(
         ResiduePoly::<Z128, EXTENSION_DEGREE>::ZERO,
-        |acc, column| {
-            acc + sns_secret_key[column]
-                * ResiduePoly::<Z128, EXTENSION_DEGREE>::from_scalar(Wrapping(
-                    mask.as_ref()[column],
-                ))
+        |acc, (sk, m)| {
+            let tmp =
+                <ResiduePoly<Z128, EXTENSION_DEGREE> as Mul<Z128>>::mul(sk, Wrapping::<u128>(*m));
+            acc + tmp
         },
     );
     // b-<a, s>
@@ -1071,16 +1254,21 @@ where
 pub fn partial_decrypt64<const EXTENSION_DEGREE: usize>(
     sk_share: &PrivateKeySet<EXTENSION_DEGREE>,
     ksk: &LweKeyswitchKey<Vec<u64>>,
-    ct_block: &Ciphertext64Block,
+    ct_block: &tfhe::shortint::Ciphertext,
 ) -> anyhow::Result<ResiduePoly<Z64, EXTENSION_DEGREE>>
 where
-    ResiduePoly<Z64, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect,
 {
     let ciphertext_modulus = 64;
     let mut output_ctxt;
 
+    let pbs_order = match ct_block.atomic_pattern {
+        tfhe::shortint::AtomicPatternKind::Standard(pbsorder) => pbsorder,
+        tfhe::shortint::AtomicPatternKind::KeySwitch32 => PBSOrder::KeyswitchBootstrap,
+    };
+
     //If ctype = F-GLWE we need to KS before doing the decryption
-    let (mask, body) = if ct_block.pbs_order == PBSOrder::KeyswitchBootstrap {
+    let (mask, body) = if pbs_order == PBSOrder::KeyswitchBootstrap {
         output_ctxt = LweCiphertext::new(0, ksk.output_lwe_size(), ksk.ciphertext_modulus());
         keyswitch_lwe_ciphertext(ksk, &ct_block.ct, &mut output_ctxt);
         output_ctxt.get_mask_and_body()
@@ -1088,15 +1276,16 @@ where
         ct_block.ct.get_mask_and_body()
     };
 
-    let key_share64 = sk_share
-        .lwe_compute_secret_key_share
-        .data_as_raw_vec()
-        .clone();
-    let a_time_s =
-        (0..key_share64.len()).fold(ResiduePoly::<Z64, EXTENSION_DEGREE>::ZERO, |acc, column| {
-            acc + key_share64[column]
-                * ResiduePoly::<Z64, EXTENSION_DEGREE>::from_scalar(Wrapping(mask.as_ref()[column]))
-        });
+    let key_share64 = sk_share.lwe_compute_secret_key_share.data_as_raw_iter();
+    let a_time_s = key_share64.zip_eq(mask.as_ref()).fold(
+        ResiduePoly::<Z64, EXTENSION_DEGREE>::ZERO,
+        |acc, (sk, m)| {
+            let tmp =
+                <ResiduePoly<Z64, EXTENSION_DEGREE> as Mul<Z64>>::mul(sk, Wrapping::<u64>(*m));
+            acc + tmp
+        },
+    );
+
     // b-<a, s>
     // Compute Delta, taking into account that total_block_bits omits the additional padding bit
     let delta_pad_bits = ciphertext_modulus - (sk_share.parameters.total_block_bits() + 1);
@@ -1111,42 +1300,40 @@ where
 #[cfg(test)]
 mod tests {
     use crate::algebra::structure_traits::{Derive, ErrorCorrect, Invert, Solve};
-    use crate::execution::endpoints::decryption::DecryptionMode;
+    use crate::execution::endpoints::decryption::{DecryptionMode, RadixOrBoolCiphertext};
+    use crate::execution::endpoints::decryption_non_wasm::threshold_decrypt64_maybe_malicious;
     use crate::execution::sharing::shamir::RevealOp;
-    use crate::execution::tfhe_internals::test_feature::KeySet;
+    use crate::execution::tfhe_internals::test_feature::{
+        keygen_all_party_shares_from_keyset, KeySet,
+    };
+    use crate::malicious_execution::endpoints::decryption::DroppingOnlineNoiseFloodDecryption;
     use crate::networking::NetworkMode;
     use crate::{
         algebra::base_ring::{Z128, Z64},
         algebra::galois_rings::common::ResiduePoly,
-        execution::tfhe_internals::test_feature::keygen_all_party_shares,
         execution::{
             constants::SMALL_TEST_KEY_PATH,
-            endpoints::decryption::threshold_decrypt64,
             runtime::{
-                party::{Identity, Role},
-                test_runtime::{generate_fixed_identities, DistributedTestRuntime},
+                party::Role,
+                test_runtime::{generate_fixed_roles, DistributedTestRuntime},
             },
             sharing::{shamir::ShamirSharings, share::Share},
         },
-        file_handling::read_element,
+        file_handling::tests::read_element,
     };
     use aes_prng::AesRng;
     use rand::SeedableRng;
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
+    use tfhe::shortint::atomic_pattern::AtomicPatternServerKey;
     use tfhe::{prelude::FheEncrypt, FheUint8};
 
     #[test]
     fn reconstruct_key() {
         let parties = 5;
         let keyset: KeySet = read_element(SMALL_TEST_KEY_PATH).unwrap();
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key.clone();
-        let params = keyset.sns_secret_key.params;
-        let shares = keygen_all_party_shares::<_, 4>(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
+        let params = keyset.get_cpu_params().unwrap();
+        let shares = keygen_all_party_shares_from_keyset::<_, 4>(
+            &keyset,
             params,
             &mut AesRng::seed_from_u64(0),
             parties,
@@ -1156,7 +1343,7 @@ mod tests {
         let mut first_bit_shares = Vec::with_capacity(parties);
         (0..parties).for_each(|i| {
             first_bit_shares.push(Share::new(
-                Role::indexed_by_zero(i),
+                Role::indexed_from_zero(i),
                 *shares[i]
                     .glwe_secret_key_share_sns_as_lwe
                     .as_ref()
@@ -1169,346 +1356,391 @@ mod tests {
         let first_bit_sharing = ShamirSharings::create(first_bit_shares);
         let rec = first_bit_sharing.err_reconstruct(1, 0).unwrap();
         let inner_rec = rec.to_scalar().unwrap();
-        assert_eq!(keyset.sns_secret_key.key.into_container()[0], inner_rec.0);
+        assert_eq!(
+            keyset
+                .get_raw_glwe_client_sns_key()
+                .unwrap()
+                .into_container()[0],
+            inner_rec.0
+        );
     }
 
-    #[test]
-    fn test_large_threshold_decrypt_f4() {
-        test_large_threshold_decrypt::<4>()
+    #[tokio::test]
+    async fn test_large_threshold_decrypt_f4() {
+        test_large_threshold_decrypt::<4>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_3")]
-    #[test]
-    fn test_large_threshold_decrypt_f3() {
-        test_large_threshold_decrypt::<3>()
+    #[tokio::test]
+    async fn test_large_threshold_decrypt_f3() {
+        test_large_threshold_decrypt::<3>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_5")]
-    #[test]
-    fn test_large_threshold_decrypt_f5() {
-        test_large_threshold_decrypt::<5>()
+    #[tokio::test]
+    async fn test_large_threshold_decrypt_f5() {
+        test_large_threshold_decrypt::<5>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_6")]
-    #[test]
-    fn test_large_threshold_decrypt_f6() {
-        test_large_threshold_decrypt::<6>()
+    #[tokio::test]
+    async fn test_large_threshold_decrypt_f6() {
+        test_large_threshold_decrypt::<6>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_7")]
-    #[test]
-    fn test_large_threshold_decrypt_f7() {
-        test_large_threshold_decrypt::<7>()
+    #[tokio::test]
+    async fn test_large_threshold_decrypt_f7() {
+        test_large_threshold_decrypt::<7>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_8")]
-    #[test]
-    fn test_large_threshold_decrypt_f8() {
-        test_large_threshold_decrypt::<8>()
+    #[tokio::test]
+    async fn test_large_threshold_decrypt_f8() {
+        test_large_threshold_decrypt::<8>(1, 5, HashSet::new()).await
     }
 
-    fn test_large_threshold_decrypt<const EXTENSION_DEGREE: usize>()
-    where
+    async fn test_large_threshold_decrypt<const EXTENSION_DEGREE: usize>(
+        threshold: usize,
+        num_parties: usize,
+        malicious_set: HashSet<Role>,
+    ) where
         ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
         ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
     {
-        let threshold = 1;
-        let num_parties = 5;
         let msg: u8 = 3;
         let keyset: KeySet = read_element(SMALL_TEST_KEY_PATH).unwrap();
-
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key;
-        let params = keyset.sns_secret_key.params;
+        let params = keyset.get_cpu_params().unwrap();
 
         let mut rng = AesRng::seed_from_u64(42);
         // generate keys
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            num_parties,
-            threshold,
-        )
-        .unwrap();
-        let (ct, _id, _tag) = FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, num_parties, threshold)
+                .unwrap();
+        let (ct, _id, _tag, _rerand_metadata) =
+            FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
 
-        let identities = generate_fixed_identities(num_parties);
+        let roles = generate_fixed_roles(num_parties);
         //Assumes Sync because preprocessing is part of the task
         let mut runtime = DistributedTestRuntime::<
             ResiduePoly<Z128, EXTENSION_DEGREE>,
+            Role,
             EXTENSION_DEGREE,
-        >::new(identities, threshold as u8, NetworkMode::Sync, None);
+        >::new(roles, threshold as u8, NetworkMode::Sync, None);
 
-        runtime.setup_conversion_key(Arc::new(keyset.public_keys.sns_key.clone().unwrap()));
+        runtime.setup_server_key(Arc::new(keyset.public_keys.server_key.clone()));
         runtime.setup_sks(key_shares);
 
-        let results_dec =
-            threshold_decrypt64(&runtime, &ct, DecryptionMode::NoiseFloodLarge).unwrap();
-        let out_dec = &results_dec[&Identity("localhost:5000".to_string())];
+        let ct = RadixOrBoolCiphertext::Radix(ct);
+        let results_dec = threshold_decrypt64_maybe_malicious::<
+            _,
+            DroppingOnlineNoiseFloodDecryption,
+            EXTENSION_DEGREE,
+        >(
+            &runtime,
+            &ct,
+            DecryptionMode::NoiseFloodLarge,
+            malicious_set.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!malicious_set.contains(&Role::indexed_from_one(1)));
+        let out_dec = &results_dec[&Role::indexed_from_one(1)];
 
         let ref_res = std::num::Wrapping(msg as u64);
         assert_eq!(*out_dec, ref_res);
     }
 
-    #[test]
-    fn test_small_threshold_decrypt_f4() {
-        test_small_threshold_decrypt::<4>()
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_f4() {
+        test_small_threshold_decrypt::<4>(1, 4, HashSet::new()).await
+    }
+
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_malicious_f4() {
+        test_small_threshold_decrypt::<4>(1, 4, HashSet::from([Role::indexed_from_zero(1)])).await
     }
 
     #[cfg(feature = "extension_degree_3")]
-    #[test]
-    fn test_small_threshold_decrypt_f3() {
-        test_small_threshold_decrypt::<3>()
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_f3() {
+        test_small_threshold_decrypt::<3>(1, 4, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_5")]
-    #[test]
-    fn test_small_threshold_decrypt_f5() {
-        test_small_threshold_decrypt::<5>()
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_f5() {
+        test_small_threshold_decrypt::<5>(1, 4, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_6")]
-    #[test]
-    fn test_small_threshold_decrypt_f6() {
-        test_small_threshold_decrypt::<6>()
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_f6() {
+        test_small_threshold_decrypt::<6>(1, 4, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_7")]
-    #[test]
-    fn test_small_threshold_decrypt_f7() {
-        test_small_threshold_decrypt::<7>()
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_f7() {
+        test_small_threshold_decrypt::<7>(1, 4, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_8")]
-    #[test]
-    fn test_small_threshold_decrypt_f8() {
-        test_small_threshold_decrypt::<8>()
+    #[tokio::test]
+    async fn test_small_threshold_decrypt_f8() {
+        test_small_threshold_decrypt::<8>(1, 4, HashSet::new()).await
     }
 
-    fn test_small_threshold_decrypt<const EXTENSION_DEGREE: usize>()
-    where
+    async fn test_small_threshold_decrypt<const EXTENSION_DEGREE: usize>(
+        threshold: usize,
+        num_parties: usize,
+        malicious_set: HashSet<Role>,
+    ) where
         ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
         ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
     {
-        let threshold = 1;
-        let num_parties = 4;
         let msg: u8 = 3;
         let keyset: KeySet = read_element(SMALL_TEST_KEY_PATH).unwrap();
-
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key;
-        let params = keyset.sns_secret_key.params;
+        let params = keyset.get_cpu_params().unwrap();
 
         let mut rng = AesRng::seed_from_u64(42);
         // generate keys
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            num_parties,
-            threshold,
-        )
-        .unwrap();
-        let (ct, _id, _tag) = FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, num_parties, threshold)
+                .unwrap();
+        let (ct, _id, _tag, _rerand_metadata) =
+            FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
 
-        let identities = generate_fixed_identities(num_parties);
+        let roles = generate_fixed_roles(num_parties);
         //Assumes Sync because preprocessing is part of the task
         let mut runtime = DistributedTestRuntime::<
             ResiduePoly<Z128, EXTENSION_DEGREE>,
+            Role,
             EXTENSION_DEGREE,
-        >::new(identities, threshold as u8, NetworkMode::Sync, None);
+        >::new(roles, threshold as u8, NetworkMode::Sync, None);
 
-        runtime.setup_conversion_key(Arc::new(keyset.public_keys.sns_key.clone().unwrap()));
         runtime.setup_sks(key_shares);
+        runtime.setup_server_key(Arc::new(keyset.public_keys.server_key.clone()));
 
-        let results_dec =
-            threshold_decrypt64(&runtime, &ct, DecryptionMode::NoiseFloodSmall).unwrap();
-        let out_dec = &results_dec[&Identity("localhost:5000".to_string())];
+        let ct = RadixOrBoolCiphertext::Radix(ct);
+        let results_dec = threshold_decrypt64_maybe_malicious::<
+            _,
+            DroppingOnlineNoiseFloodDecryption,
+            EXTENSION_DEGREE,
+        >(
+            &runtime,
+            &ct,
+            DecryptionMode::NoiseFloodSmall,
+            malicious_set.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!malicious_set.contains(&Role::indexed_from_one(1)));
+        let out_dec = &results_dec[&Role::indexed_from_one(1)];
 
         let ref_res = std::num::Wrapping(msg as u64);
         assert_eq!(*out_dec, ref_res);
     }
 
-    #[test]
-    fn test_small_bitdec_threshold_decrypt_f4() {
-        test_small_bitdec_threshold_decrypt::<4>()
+    #[tokio::test]
+    async fn test_small_bitdec_threshold_decrypt_f4() {
+        test_small_bitdec_threshold_decrypt::<4>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_3")]
-    #[test]
-    fn test_small_bitdec_threshold_decrypt_f3() {
-        test_small_bitdec_threshold_decrypt::<3>()
+    #[tokio::test]
+    async fn test_small_bitdec_threshold_decrypt_f3() {
+        test_small_bitdec_threshold_decrypt::<3>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_5")]
-    #[test]
-    fn test_small_bitdec_threshold_decrypt_f5() {
-        test_small_bitdec_threshold_decrypt::<5>()
+    #[tokio::test]
+    async fn test_small_bitdec_threshold_decrypt_f5() {
+        test_small_bitdec_threshold_decrypt::<5>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_6")]
-    #[test]
-    fn test_small_bitdec_threshold_decrypt_f6() {
-        test_small_bitdec_threshold_decrypt::<6>()
+    #[tokio::test]
+    async fn test_small_bitdec_threshold_decrypt_f6() {
+        test_small_bitdec_threshold_decrypt::<6>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_7")]
-    #[test]
-    fn test_small_bitdec_threshold_decrypt_f7() {
-        test_small_bitdec_threshold_decrypt::<7>()
+    #[tokio::test]
+    async fn test_small_bitdec_threshold_decrypt_f7() {
+        test_small_bitdec_threshold_decrypt::<7>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_8")]
-    #[test]
-    fn test_small_bitdec_threshold_decrypt_f8() {
-        test_small_bitdec_threshold_decrypt::<8>()
+    #[tokio::test]
+    async fn test_small_bitdec_threshold_decrypt_f8() {
+        test_small_bitdec_threshold_decrypt::<8>(1, 5, HashSet::new()).await
     }
 
-    fn test_small_bitdec_threshold_decrypt<const EXTENSION_DEGREE: usize>()
-    where
+    async fn test_small_bitdec_threshold_decrypt<const EXTENSION_DEGREE: usize>(
+        threshold: usize,
+        num_parties: usize,
+        malicious_set: HashSet<Role>,
+    ) where
         ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
         ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
     {
-        let threshold = 1;
-        let num_parties = 5;
         let msg: u8 = 3;
         let keyset: KeySet = read_element(SMALL_TEST_KEY_PATH).unwrap();
-
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key;
-        let params = keyset.sns_secret_key.params;
+        let params = keyset.get_cpu_params().unwrap();
 
         let mut rng = AesRng::seed_from_u64(42);
         // generate keys
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            num_parties,
-            threshold,
-        )
-        .unwrap();
-        let (ct, _id, _tag) = FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, num_parties, threshold)
+                .unwrap();
+        let (ct, _id, _tag, _rerand_metadata) =
+            FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
 
-        let identities = generate_fixed_identities(num_parties);
+        let roles = generate_fixed_roles(num_parties);
         //Assumes Sync because preprocessing is part of the task
         let mut runtime = DistributedTestRuntime::<
             ResiduePoly<Z64, EXTENSION_DEGREE>,
+            Role,
             EXTENSION_DEGREE,
-        >::new(identities, threshold as u8, NetworkMode::Sync, None);
+        >::new(roles, threshold as u8, NetworkMode::Sync, None);
 
         runtime.setup_sks(key_shares);
-        runtime.setup_ks(Arc::new(
-            keyset
+        runtime.setup_ks(
+            match &keyset
                 .public_keys
                 .server_key
-                .into_raw_parts()
-                .0
-                .into_raw_parts()
-                .key_switching_key,
-        ));
+                .as_ref()
+                .as_ref()
+                .atomic_pattern
+            {
+                AtomicPatternServerKey::Standard(ap) => Arc::new(ap.key_switching_key.clone()),
+                AtomicPatternServerKey::KeySwitch32(_) => {
+                    panic!("Unsupported KeySwitch32 AP",);
+                }
+                AtomicPatternServerKey::Dynamic(_) => {
+                    panic!("Unsupported Dynamic AP",);
+                }
+            },
+        );
 
-        let results_dec = threshold_decrypt64(&runtime, &ct, DecryptionMode::BitDecSmall).unwrap();
-        let out_dec = &results_dec[&Identity("localhost:5000".to_string())];
+        let ct = RadixOrBoolCiphertext::Radix(ct);
+        let results_dec = threshold_decrypt64_maybe_malicious::<
+            _,
+            DroppingOnlineNoiseFloodDecryption,
+            EXTENSION_DEGREE,
+        >(
+            &runtime,
+            &ct,
+            DecryptionMode::BitDecSmall,
+            malicious_set.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!malicious_set.contains(&Role::indexed_from_one(1)));
+        let out_dec = &results_dec[&Role::indexed_from_one(1)];
 
         let ref_res = std::num::Wrapping(msg as u64);
         assert_eq!(*out_dec, ref_res);
     }
 
-    #[test]
-    fn test_large_bitdec_threshold_decrypt_f4() {
-        test_large_bitdec_threshold_decrypt::<4>()
+    #[tokio::test]
+    async fn test_large_bitdec_threshold_decrypt_f4() {
+        test_large_bitdec_threshold_decrypt::<4>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_3")]
-    #[test]
-    fn test_large_bitdec_threshold_decrypt_f3() {
-        test_large_bitdec_threshold_decrypt::<3>()
+    #[tokio::test]
+    async fn test_large_bitdec_threshold_decrypt_f3() {
+        test_large_bitdec_threshold_decrypt::<3>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_5")]
-    #[test]
-    fn test_large_bitdec_threshold_decrypt_f5() {
-        test_large_bitdec_threshold_decrypt::<5>()
+    #[tokio::test]
+    async fn test_large_bitdec_threshold_decrypt_f5() {
+        test_large_bitdec_threshold_decrypt::<5>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_6")]
-    #[test]
-    fn test_large_bitdec_threshold_decrypt_f6() {
-        test_large_bitdec_threshold_decrypt::<6>()
+    #[tokio::test]
+    async fn test_large_bitdec_threshold_decrypt_f6() {
+        test_large_bitdec_threshold_decrypt::<6>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_7")]
-    #[test]
-    fn test_large_bitdec_threshold_decrypt_f7() {
-        test_large_bitdec_threshold_decrypt::<7>()
+    #[tokio::test]
+    async fn test_large_bitdec_threshold_decrypt_f7() {
+        test_large_bitdec_threshold_decrypt::<7>(1, 5, HashSet::new()).await
     }
 
     #[cfg(feature = "extension_degree_8")]
-    #[test]
-    fn test_large_bitdec_threshold_decrypt_f8() {
-        test_large_bitdec_threshold_decrypt::<8>()
+    #[tokio::test]
+    async fn test_large_bitdec_threshold_decrypt_f8() {
+        test_large_bitdec_threshold_decrypt::<8>(1, 5, HashSet::new()).await
     }
 
-    fn test_large_bitdec_threshold_decrypt<const EXTENSION_DEGREE: usize>()
-    where
+    async fn test_large_bitdec_threshold_decrypt<const EXTENSION_DEGREE: usize>(
+        threshold: usize,
+        num_parties: usize,
+        malicious_set: HashSet<Role>,
+    ) where
         ResiduePoly<Z128, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
         ResiduePoly<Z64, EXTENSION_DEGREE>: ErrorCorrect + Invert + Solve + Derive,
     {
-        let threshold = 1;
-        let num_parties = 5;
         let msg: u8 = 15;
         let keyset: KeySet = read_element(SMALL_TEST_KEY_PATH).unwrap();
-
-        let lwe_secret_key = keyset.get_raw_lwe_client_key();
-        let glwe_secret_key = keyset.get_raw_glwe_client_key();
-        let glwe_secret_key_sns_as_lwe = keyset.sns_secret_key.key;
-        let params = keyset.sns_secret_key.params;
+        let params = keyset.get_cpu_params().unwrap();
 
         let mut rng = AesRng::seed_from_u64(42);
         // generate keys
-        let key_shares = keygen_all_party_shares(
-            lwe_secret_key,
-            glwe_secret_key,
-            glwe_secret_key_sns_as_lwe,
-            params,
-            &mut rng,
-            num_parties,
-            threshold,
-        )
-        .unwrap();
-        let (ct, _id, _tag) = FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
+        let key_shares =
+            keygen_all_party_shares_from_keyset(&keyset, params, &mut rng, num_parties, threshold)
+                .unwrap();
+        let (ct, _id, _tag, _rerand_metadata) =
+            FheUint8::encrypt(msg, &keyset.client_key).into_raw_parts();
 
-        let identities = generate_fixed_identities(num_parties);
+        let roles = generate_fixed_roles(num_parties);
         //Assumes Sync because preprocessing is part of the task
         let mut runtime = DistributedTestRuntime::<
             ResiduePoly<Z64, EXTENSION_DEGREE>,
+            Role,
             EXTENSION_DEGREE,
-        >::new(identities, threshold as u8, NetworkMode::Sync, None);
+        >::new(roles, threshold as u8, NetworkMode::Sync, None);
 
         runtime.setup_sks(key_shares);
-        runtime.setup_ks(Arc::new(
-            keyset
+        runtime.setup_ks(
+            match &keyset
                 .public_keys
                 .server_key
-                .into_raw_parts()
-                .0
-                .into_raw_parts()
-                .key_switching_key,
-        ));
+                .as_ref()
+                .as_ref()
+                .atomic_pattern
+            {
+                AtomicPatternServerKey::Standard(ap) => Arc::new(ap.key_switching_key.clone()),
+                AtomicPatternServerKey::KeySwitch32(_) => {
+                    panic!("Unsupported KeySwitch32 AP",);
+                }
+                AtomicPatternServerKey::Dynamic(_) => {
+                    panic!("Unsupported Dynamic AP",);
+                }
+            },
+        );
 
-        let results_dec = threshold_decrypt64(&runtime, &ct, DecryptionMode::BitDecLarge).unwrap();
-        let out_dec = &results_dec[&Identity("localhost:5000".to_string())];
+        let ct = RadixOrBoolCiphertext::Radix(ct);
+        let results_dec = threshold_decrypt64_maybe_malicious::<
+            _,
+            DroppingOnlineNoiseFloodDecryption,
+            EXTENSION_DEGREE,
+        >(
+            &runtime,
+            &ct,
+            DecryptionMode::BitDecLarge,
+            malicious_set.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!malicious_set.contains(&Role::indexed_from_one(1)));
+        let out_dec = &results_dec[&Role::indexed_from_one(1)];
 
         let ref_res = std::num::Wrapping(msg as u64);
         assert_eq!(*out_dec, ref_res);

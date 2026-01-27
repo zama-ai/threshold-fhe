@@ -1,5 +1,5 @@
-use crate::execution::endpoints::decryption::DecryptionMode;
-use crate::execution::tfhe_internals::parameters::{Ciphertext64, DKGParams};
+use crate::execution::endpoints::decryption::{DecryptionMode, RadixOrBoolCiphertext};
+use crate::execution::tfhe_internals::parameters::DKGParams;
 use crate::session_id::SessionId;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub struct ThresholdDecryptParams {
     pub decryption_mode: DecryptionMode,
     pub key_sid: SessionId,
     pub preproc_sid: Option<SessionId>,
-    pub ctxts: Vec<Ciphertext64>,
+    pub ctxts: Vec<RadixOrBoolCiphertext>,
     pub tfhe_type: TfheType,
     // If Some, copies each ctxts the given
     // number of times and spawns
@@ -74,6 +74,13 @@ pub struct ThresholdDecryptParams {
 pub struct CrsGenParams {
     pub session_id: SessionId,
     pub witness_dim: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReshareParams {
+    pub session_type: SessionType,
+    pub old_key_sid: SessionId,
+    pub new_key_sid: SessionId,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

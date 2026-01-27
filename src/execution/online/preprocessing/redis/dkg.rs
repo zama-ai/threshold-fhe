@@ -1,15 +1,15 @@
 use tonic::async_trait;
 
 use crate::{
-    algebra::structure_traits::{ErrorCorrect, Invert, Ring, RingEmbed, Solve},
+    algebra::structure_traits::{ErrorCorrect, Invert, Solve},
     error::error_handler::anyhow_error_and_log,
     execution::{
         keyset_config::KeySetConfig,
         online::{
-            gen_bits::{BitGenEven, RealBitGenEven},
+            gen_bits::{BitGenEven, SecureBitGenEven},
             preprocessing::{BasePreprocessing, BitPreprocessing, DKGPreprocessing, NoiseBounds},
         },
-        runtime::session::BaseSession,
+        runtime::sessions::base_session::BaseSession,
         sharing::share::Share,
         small_execution::prf::PRSSConversions,
         tfhe_internals::parameters::DKGParams,
@@ -24,7 +24,7 @@ use super::{
 #[async_trait]
 impl<Z> DKGPreprocessing<Z> for RedisPreprocessing<Z>
 where
-    Z: Ring + RingEmbed + Solve + Invert + ErrorCorrect + PRSSConversions,
+    Z: Solve + Invert + ErrorCorrect + PRSSConversions,
 {
     fn append_noises(&mut self, noises: Vec<Share<Z>>, bound: NoiseBounds) {
         // TODO unwrap is ok?
@@ -63,7 +63,7 @@ where
             .total_bits_required(keyset_config);
 
         self.append_bits(
-            RealBitGenEven::gen_bits_even(num_bits_required, preprocessing, session).await?,
+            SecureBitGenEven::gen_bits_even(num_bits_required, preprocessing, session).await?,
         );
 
         let mut bit_preproc = self.clone();

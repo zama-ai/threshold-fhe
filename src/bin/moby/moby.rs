@@ -1,10 +1,11 @@
 use clap::Parser;
-use conf_trace::conf::{Settings, TelemetryConfig};
-use conf_trace::telemetry::init_tracing;
+use observability::conf::{Settings, TelemetryConfig};
+use observability::telemetry::init_tracing;
 #[cfg(feature = "measure_memory")]
 use peak_alloc::PeakAlloc;
 use threshold_fhe::conf::party::PartyConf;
 use threshold_fhe::grpc;
+use tokio_rustls::rustls::crypto::aws_lc_rs::default_provider;
 
 #[cfg(feature = "measure_memory")]
 #[global_allocator]
@@ -65,6 +66,7 @@ const EXTENSION_DEGREE: usize = 8;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    default_provider().install_default().unwrap();
     #[cfg(feature = "measure_memory")]
     threshold_fhe::allocator::MEM_ALLOCATOR.get_or_init(|| PEAK_ALLOC);
 
@@ -82,12 +84,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings_builder.env_prefix("DDEC").build().init_conf()?
     };
 
-    let telemetry_config = settings.telemetry.clone().unwrap_or(
+    let telemetry_config = settings.telemetry.clone().unwrap_or_else(|| {
         TelemetryConfig::builder()
             .tracing_service_name("moby".to_string())
-            .build(),
-    );
+            .build()
+    });
 
-    init_tracing(&telemetry_config)?;
-    grpc::server::run::<EXTENSION_DEGREE>(&settings).await
+    let tracer_provider = init_tracing(&telemetry_config).await?;
+
+    // Run the server and get the result
+    let result = grpc::server::run::<EXTENSION_DEGREE>(&settings).await;
+
+    // After the server has completed, shut down telemetry
+    // Sleep to let some time for the process to export all the spans before shutdown
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Explicitly shut down telemetry
+    if let Err(e) = tracer_provider.shutdown() {
+        eprintln!("Error shutting down tracer provider: {e}");
+    }
+
+    result
 }

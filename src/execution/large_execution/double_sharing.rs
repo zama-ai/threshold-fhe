@@ -1,21 +1,23 @@
 use super::{
-    local_double_share::{DoubleShares, LocalDoubleShare},
+    local_double_share::{DoubleShares, LocalDoubleShare, SecureLocalDoubleShare},
     single_sharing::init_vdm,
 };
 use crate::{
     algebra::{
         bivariate::MatrixMul,
-        structure_traits::{Derive, ErrorCorrect, Invert, Ring, RingEmbed},
+        structure_traits::{Derive, ErrorCorrect, Invert, Ring},
     },
     error::error_handler::anyhow_error_and_log,
-    execution::runtime::{party::Role, session::LargeSessionHandles},
+    execution::runtime::{party::Role, sessions::large_session::LargeSessionHandles},
+    ProtocolDescription,
 };
 use async_trait::async_trait;
 use itertools::Itertools;
 use ndarray::{ArrayD, IxDyn};
-use rand::{CryptoRng, Rng};
 use std::collections::HashMap;
 use tracing::instrument;
+
+pub type SecureDoubleSharing<Z> = RealDoubleSharing<Z, SecureLocalDoubleShare>;
 
 type DoubleArrayShares<Z> = (ArrayD<Z>, ArrayD<Z>);
 
@@ -25,14 +27,14 @@ pub struct DoubleShare<Z> {
 }
 
 #[async_trait]
-pub trait DoubleSharing<Z: Ring>: Send + Sync + Default + Clone {
-    async fn init<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
+pub trait DoubleSharing<Z: Ring>: ProtocolDescription + Send + Sync + Clone {
+    async fn init<L: LargeSessionHandles>(
         &mut self,
         session: &mut L,
         l: usize,
     ) -> anyhow::Result<()>;
 
-    async fn next<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
+    async fn next<L: LargeSessionHandles>(
         &mut self,
         session: &mut L,
     ) -> anyhow::Result<DoubleShare<Z>>;
@@ -40,7 +42,6 @@ pub trait DoubleSharing<Z: Ring>: Send + Sync + Default + Clone {
 
 //Might want to store the dispute set at the output of the ldl call
 //as that'll influence how to reconstruct stuff later on
-#[derive(Clone, Default)]
 pub struct RealDoubleSharing<Z, S: LocalDoubleShare> {
     local_double_share: S,
     available_ldl: Vec<DoubleArrayShares<Z>>,
@@ -49,12 +50,50 @@ pub struct RealDoubleSharing<Z, S: LocalDoubleShare> {
     vdm_matrix: ArrayD<Z>,
 }
 
+impl<Z, S: LocalDoubleShare> ProtocolDescription for RealDoubleSharing<Z, S> {
+    fn protocol_desc(depth: usize) -> String {
+        let indent = Self::INDENT_STRING.repeat(depth);
+        format!(
+            "{}-RealDoubleSharing:\n{}",
+            indent,
+            S::protocol_desc(depth + 1)
+        )
+    }
+}
+
+//Custom implementaiton of Clone to make sure we do not clone
+//the internal state as that would be insecure
+//What we may want is to clone the underlying strategy
+impl<Z: Default, S: LocalDoubleShare> Clone for RealDoubleSharing<Z, S> {
+    fn clone(&self) -> Self {
+        Self::new(self.local_double_share.clone())
+    }
+}
+
+impl<Z: Default, S: LocalDoubleShare> RealDoubleSharing<Z, S> {
+    pub fn new(local_double_share: S) -> Self {
+        Self {
+            local_double_share,
+            available_ldl: Vec::default(),
+            available_shares: Vec::default(),
+            max_num_iterations: usize::default(),
+            vdm_matrix: ArrayD::<Z>::default(IxDyn::default()),
+        }
+    }
+}
+
+impl<Z: Default, S: LocalDoubleShare + Default> Default for RealDoubleSharing<Z, S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
 #[async_trait]
-impl<Z: Ring + RingEmbed + Derive + ErrorCorrect + Invert, S: LocalDoubleShare> DoubleSharing<Z>
+impl<Z: Derive + ErrorCorrect + Invert, S: LocalDoubleShare> DoubleSharing<Z>
     for RealDoubleSharing<Z, S>
 {
-    #[instrument(name="DoubleSharing.Init",skip(self,session),fields(sid = ?session.session_id(),own_identity=?session.own_identity(), batch_size = ?l))]
-    async fn init<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
+    #[instrument(name="DoubleSharing.Init",skip(self,session),fields(sid = ?session.session_id(),my_role=?session.my_role(), batch_size = ?l))]
+    async fn init<L: LargeSessionHandles>(
         &mut self,
         session: &mut L,
         l: usize,
@@ -88,7 +127,7 @@ impl<Z: Ring + RingEmbed + Derive + ErrorCorrect + Invert, S: LocalDoubleShare> 
     }
 
     //NOTE: This is instrumented by the caller function to use the same span for all calls
-    async fn next<R: Rng + CryptoRng, L: LargeSessionHandles<R>>(
+    async fn next<L: LargeSessionHandles>(
         &mut self,
         session: &mut L,
     ) -> anyhow::Result<DoubleShare<Z>> {
@@ -138,7 +177,7 @@ fn format_for_next<Z: Ring>(
         let mut vec_2t = Vec::with_capacity(num_parties);
         for party_idx in 0..num_parties {
             let double_share_j = local_double_shares
-                .get(&Role::indexed_by_zero(party_idx))
+                .get(&Role::indexed_from_zero(party_idx))
                 .ok_or_else(|| {
                     anyhow_error_and_log(format!("Can not find shares for Party {}", party_idx + 1))
                 })?;
@@ -171,8 +210,12 @@ fn compute_next_batch<Z: Ring>(
         .matmul(vdm)?
         .into_raw_vec_and_offset()
         .0;
-    let res = res_t.into_iter().zip(res_2t).collect_vec();
-    Ok(res)
+    if res_t.len() != res_2t.len() {
+        return Err(anyhow_error_and_log(
+            "The size of the degree t and 2t vectors are not equal",
+        ));
+    }
+    Ok(res_t.into_iter().zip_eq(res_2t).collect_vec())
 }
 
 #[cfg(test)]
@@ -185,43 +228,24 @@ pub(crate) mod tests {
     use crate::algebra::structure_traits::Derive;
     use crate::algebra::structure_traits::ErrorCorrect;
     use crate::algebra::structure_traits::Invert;
-    use crate::algebra::structure_traits::RingEmbed;
     use crate::execution::large_execution::constants::DISPUTE_STAT_SEC;
-    use crate::execution::runtime::session::BaseSessionHandles;
+    use crate::execution::large_execution::double_sharing::SecureDoubleSharing;
+    use crate::execution::runtime::sessions::base_session::GenericBaseSessionHandles;
+    use crate::execution::runtime::sessions::session_parameters::GenericParameterHandles;
     use crate::execution::sharing::shamir::RevealOp;
     use crate::networking::NetworkMode;
     use crate::{
         algebra::structure_traits::{Ring, Sample},
         execution::{
-            large_execution::{
-                coinflip::RealCoinflip,
-                double_sharing::{DoubleShare, DoubleSharing, LocalDoubleShare, RealDoubleSharing},
-                local_double_share::RealLocalDoubleShare,
-                share_dispute::RealShareDispute,
-                vss::RealVss,
-            },
-            runtime::{
-                party::Role,
-                session::{LargeSession, ParameterHandles},
-            },
+            large_execution::double_sharing::{DoubleShare, DoubleSharing},
+            runtime::{party::Role, sessions::large_session::LargeSession},
             sharing::{shamir::ShamirSharings, share::Share},
         },
         tests::helper::tests_and_benches::execute_protocol_large,
     };
 
-    type TrueLocalDoubleShare = RealLocalDoubleShare<RealCoinflip<RealVss>, RealShareDispute>;
-
-    pub(crate) fn create_real_double_sharing<Z: Ring, L: LocalDoubleShare>(
-        ldl_strategy: L,
-    ) -> RealDoubleSharing<Z, L> {
-        RealDoubleSharing {
-            local_double_share: ldl_strategy,
-            ..Default::default()
-        }
-    }
-    //#[test]
-    fn test_doublesharing<
-        Z: Ring + RingEmbed + ErrorCorrect + Derive + Invert,
+    async fn test_doublesharing<
+        Z: ErrorCorrect + Derive + Invert,
         const EXTENSION_DEGREE: usize,
     >(
         parties: usize,
@@ -232,7 +256,7 @@ pub(crate) mod tests {
             let extracted_size = session.num_parties() - session.threshold() as usize;
             let num_output = ldl_batch_size * extracted_size + 1;
             let mut res = Vec::new();
-            let mut double_sharing = RealDoubleSharing::<Z, TrueLocalDoubleShare>::default();
+            let mut double_sharing = SecureDoubleSharing::<Z>::default();
             double_sharing
                 .init(&mut session, ldl_batch_size)
                 .await
@@ -240,7 +264,7 @@ pub(crate) mod tests {
             for _ in 0..num_output {
                 res.push(double_sharing.next(&mut session).await.unwrap());
             }
-            (session.my_role().unwrap(), res)
+            (session.my_role(), res)
         };
 
         // Rounds (only on the happy path here)
@@ -263,7 +287,8 @@ pub(crate) mod tests {
             NetworkMode::Sync,
             None,
             &mut task,
-        );
+        )
+        .await;
 
         //Check we can reconstruct both degree t and 2t, and they are equal
         let ldl_batch_size = 10_usize;
@@ -290,25 +315,27 @@ pub(crate) mod tests {
     #[rstest]
     #[case(4, 1)]
     #[case(7, 2)]
-    fn test_doublesharing_z128(#[case] num_parties: usize, #[case] threshold: usize) {
+    async fn test_doublesharing_z128(#[case] num_parties: usize, #[case] threshold: usize) {
         test_doublesharing::<ResiduePolyF4Z128, { ResiduePolyF4Z128::EXTENSION_DEGREE }>(
             num_parties,
             threshold,
-        );
+        )
+        .await;
     }
 
     #[rstest]
     #[case(4, 1)]
     #[case(7, 2)]
-    fn test_doublesharing_z64(#[case] num_parties: usize, #[case] threshold: usize) {
+    async fn test_doublesharing_z64(#[case] num_parties: usize, #[case] threshold: usize) {
         test_doublesharing::<ResiduePolyF4Z64, { ResiduePolyF4Z64::EXTENSION_DEGREE }>(
             num_parties,
             threshold,
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn test_doublesharing_dropout() {
+    #[tokio::test]
+    async fn test_doublesharing_dropout() {
         let parties = 5;
         let threshold = 1;
 
@@ -317,9 +344,8 @@ pub(crate) mod tests {
             let extracted_size = session.num_parties() - session.threshold() as usize;
             let num_output = ldl_batch_size * extracted_size + 1;
             let mut res = Vec::new();
-            if session.my_role().unwrap().zero_based() != 1 {
-                let mut double_sharing =
-                    RealDoubleSharing::<ResiduePolyF4Z128, TrueLocalDoubleShare>::default();
+            if session.my_role().one_based() != 1 {
+                let mut double_sharing = SecureDoubleSharing::<ResiduePolyF4Z128>::default();
                 double_sharing
                     .init(&mut session, ldl_batch_size)
                     .await
@@ -327,7 +353,7 @@ pub(crate) mod tests {
                 for _ in 0..num_output {
                     res.push(double_sharing.next(&mut session).await.unwrap());
                 }
-                assert!(session.corrupt_roles().contains(&Role::indexed_by_zero(1)));
+                assert!(session.corrupt_roles().contains(&Role::indexed_from_one(1)));
             } else {
                 for _ in 0..num_output {
                     res.push(DoubleShare {
@@ -336,7 +362,7 @@ pub(crate) mod tests {
                     })
                 }
             }
-            (session.my_role().unwrap(), res)
+            (session.my_role(), res)
         }
 
         //DoubleSharing assumes Sync network
@@ -345,7 +371,8 @@ pub(crate) mod tests {
             _,
             ResiduePolyF4Z128,
             { ResiduePolyF4Z128::EXTENSION_DEGREE },
-        >(parties, threshold, None, NetworkMode::Sync, None, &mut task);
+        >(parties, threshold, None, NetworkMode::Sync, None, &mut task)
+        .await;
 
         //Check we can reconstruct both degree t and 2t, and they are equal
         let ldl_batch_size = 10_usize;
@@ -358,7 +385,7 @@ pub(crate) mod tests {
             for (role, res) in result.iter() {
                 res_vec_t.push(Share::new(*role, res[value_idx].degree_t));
                 //Dont take into account corrupt party's share (due to pol. degree)
-                if role.zero_based() != 1 {
+                if role.one_based() != 1 {
                     res_vec_2t.push(Share::new(*role, res[value_idx].degree_2t));
                 }
             }

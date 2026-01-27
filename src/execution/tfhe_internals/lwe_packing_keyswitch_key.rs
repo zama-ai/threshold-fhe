@@ -1,14 +1,22 @@
 use itertools::Itertools;
-use rand::{CryptoRng, Rng};
+use num_traits::Zero;
+use std::slice::IterMut;
 use tfhe::{
     boolean::prelude::{
         DecompositionBaseLog, DecompositionLevelCount, GlweDimension, LweDimension, PolynomialSize,
     },
-    core_crypto::prelude::{
-        CiphertextModulus, ContiguousEntityContainerMut, GlweSize, LwePackingKeyswitchKeyOwned,
+    core_crypto::{
+        commons::math::random::CompressionSeed,
+        prelude::{
+            CiphertextModulus, ContiguousEntityContainerMut, GlweSize, LwePackingKeyswitchKeyOwned,
+            SeededLwePackingKeyswitchKeyOwned, UnsignedInteger,
+        },
     },
+    prelude::CastFrom,
+    Seed,
 };
 
+use super::{glwe_ciphertext::GlweCiphertextShare, parameters::EncryptionType};
 use crate::{
     algebra::{
         galois_rings::common::ResiduePoly,
@@ -16,11 +24,10 @@ use crate::{
     },
     error::error_handler::anyhow_error_and_log,
     execution::{
-        online::triple::open_list, runtime::session::BaseSessionHandles, sharing::share::Share,
+        online::triple::open_list, runtime::sessions::base_session::BaseSessionHandles,
+        sharing::share::Share,
     },
 };
-
-use super::{glwe_ciphertext::GlweCiphertextShare, parameters::EncryptionType};
 
 // Data structure to hold the shares of the Packing KS
 // used for compression.
@@ -41,7 +48,7 @@ impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LwePackingKeyswitchKeyShares<Z,
 
     pub fn iter_mut_levels(
         &mut self,
-    ) -> impl Iterator<Item = &mut Vec<GlweCiphertextShare<Z, EXTENSION_DEGREE>>> {
+    ) -> IterMut<'_, Vec<GlweCiphertextShare<Z, EXTENSION_DEGREE>>> {
         self.data.iter_mut()
     }
 
@@ -84,11 +91,80 @@ impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LwePackingKeyswitchKeyShares<Z,
 where
     ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
-    pub async fn open_to_tfhers_type<R: Rng + CryptoRng, S: BaseSessionHandles<R>>(
+    pub async fn open_to_tfhers_seeded_type<
+        Scalar: Zero + UnsignedInteger + CastFrom<u8>,
+        S: BaseSessionHandles,
+    >(
+        self,
+        seed: u128,
+        session: &S,
+    ) -> anyhow::Result<SeededLwePackingKeyswitchKeyOwned<Scalar>> {
+        let my_role = session.my_role();
+        let input_key_lwe_dimension = LweDimension(self.data.len());
+        let output_key_glwe_dimension = self.output_glwe_size.to_glwe_dimension();
+        let output_key_polynomial_size = self.output_polynomial_size();
+
+        let shared_bodies: Vec<_> = self
+            .data
+            .iter()
+            .flat_map(|v1| {
+                v1.iter()
+                    .flat_map(|v2| v2.body.iter().map(|value| Share::new(my_role, *value)))
+            })
+            .collect();
+
+        let bodies: Vec<Z> = open_list(&shared_bodies, session)
+            .await?
+            .iter()
+            .map(|v| v.to_scalar())
+            .try_collect()?;
+
+        let mut ksk = SeededLwePackingKeyswitchKeyOwned::new(
+            Scalar::zero(),
+            self.decomp_base_log,
+            self.decomp_level_count,
+            input_key_lwe_dimension,
+            output_key_glwe_dimension,
+            output_key_polynomial_size,
+            CompressionSeed::from(Seed(seed)), // NOTE: the key was generated using XOF so we need to use a custom decompression function
+            CiphertextModulus::new_native(),
+        );
+
+        let mut glwe_ciphertext_list = ksk.as_mut_seeded_lwe_ciphertext_list();
+        let mut bodies_iterator = bodies.into_iter();
+
+        for mut glwe_ciphertext in glwe_ciphertext_list.iter_mut() {
+            let mut body = glwe_ciphertext.get_mut_body();
+
+            let underlying_container = body.as_mut();
+            for c_b in underlying_container.iter_mut() {
+                let body_data = {
+                    let tmp = if let Some(body) = bodies_iterator.next() {
+                        body.to_byte_vec()
+                    } else {
+                        return Err(anyhow_error_and_log(
+                            "Not enough bodies to cast the compression key to tfhe-rs type",
+                        ));
+                    };
+                    tmp.iter().rev().fold(Scalar::zero(), |acc, byte| {
+                        acc.wrapping_shl(8).wrapping_add(Scalar::cast_from(*byte))
+                    })
+                };
+                *(c_b) = body_data;
+            }
+        }
+
+        Ok(ksk)
+    }
+
+    pub async fn open_to_tfhers_type<
+        Scalar: Zero + UnsignedInteger + CastFrom<u8>,
+        S: BaseSessionHandles,
+    >(
         self,
         session: &S,
-    ) -> anyhow::Result<LwePackingKeyswitchKeyOwned<u64>> {
-        let my_role = session.my_role()?;
+    ) -> anyhow::Result<LwePackingKeyswitchKeyOwned<Scalar>> {
+        let my_role = session.my_role();
         let input_key_lwe_dimension = LweDimension(self.data.len());
         let output_key_glwe_dimension = self.output_glwe_size.to_glwe_dimension();
         let output_key_polynomial_size = self.output_polynomial_size();
@@ -115,7 +191,7 @@ where
             .collect();
 
         let mut ksk = LwePackingKeyswitchKeyOwned::new(
-            0_u64,
+            Scalar::zero(),
             self.decomp_base_log,
             self.decomp_level_count,
             input_key_lwe_dimension,
@@ -135,8 +211,8 @@ where
             for c_m in underlying_container.iter_mut() {
                 if let Some(m) = masks_iterator.next() {
                     let m_byte_vec = m.to_byte_vec();
-                    let m = m_byte_vec.iter().rev().fold(0_u64, |acc, byte| {
-                        acc.wrapping_shl(8).wrapping_add(*byte as u64)
+                    let m = m_byte_vec.iter().rev().fold(Scalar::zero(), |acc, byte| {
+                        acc.wrapping_shl(8).wrapping_add(Scalar::cast_from(*byte))
                     });
                     *c_m = m;
                 } else {
@@ -156,9 +232,8 @@ where
                             "Not enough bodies to cast the compression key to tfhe-rs type",
                         ));
                     };
-                    // Below we perform recomposition to convert Vec<u8> to u64
-                    tmp.iter().rev().fold(0_u64, |acc, byte| {
-                        acc.wrapping_shl(8).wrapping_add(*byte as u64)
+                    tmp.iter().rev().fold(Scalar::zero(), |acc, byte| {
+                        acc.wrapping_shl(8).wrapping_add(Scalar::cast_from(*byte))
                     })
                 };
                 *(c_b) = body_data;

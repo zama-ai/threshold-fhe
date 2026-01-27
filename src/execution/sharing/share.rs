@@ -32,11 +32,16 @@ impl<Z: Ring> Share<Z> {
         self.value
     }
 
+    pub fn take_value(self) -> Z {
+        self.value
+    }
+
     /// Get the designated owner of the share
     pub fn owner(&self) -> Role {
         self.owner
     }
 }
+
 impl<Z: Ring> Add for Share<Z> {
     type Output = Self;
 
@@ -50,6 +55,17 @@ impl<Z: Ring> Add for Share<Z> {
 }
 
 impl<Z: Ring> Add<&Share<Z>> for &Share<Z> {
+    type Output = Share<Z>;
+    fn add(self, rhs: &Share<Z>) -> Self::Output {
+        debug_assert_eq!(self.owner, rhs.owner);
+        Share::<Z> {
+            value: self.value + rhs.value,
+            owner: self.owner,
+        }
+    }
+}
+
+impl<Z: Ring> Add<&Share<Z>> for Share<Z> {
     type Output = Share<Z>;
     fn add(self, rhs: &Share<Z>) -> Self::Output {
         debug_assert_eq!(self.owner, rhs.owner);
@@ -127,6 +143,16 @@ impl<Z: Ring> Sub<Z> for Share<Z> {
     }
 }
 
+impl<Z: Ring> Sub<Z> for &Share<Z> {
+    type Output = Share<Z>;
+    fn sub(self, rhs: Z) -> Self::Output {
+        Share::<Z> {
+            value: self.value - rhs,
+            owner: self.owner,
+        }
+    }
+}
+
 impl<Z: Ring> SubAssign for Share<Z> {
     fn sub_assign(&mut self, rhs: Self) {
         debug_assert_eq!(self.owner, rhs.owner);
@@ -163,6 +189,17 @@ impl<Z: Ring> MulAssign<Z> for Share<Z> {
         self.value *= rhs;
     }
 }
+
+impl<Z: Ring> Mul<u128> for Share<Z> {
+    type Output = Share<Z>;
+    fn mul(self, rhs: u128) -> Self::Output {
+        Self {
+            value: self.value.mul_by_u128(rhs),
+            owner: self.owner,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::Wrapping;
@@ -175,7 +212,7 @@ mod tests {
     #[test]
     fn op_overload() {
         let share = Share::new(
-            Role::indexed_by_one(1),
+            Role::indexed_from_one(1),
             ResiduePolyF4Z128::from_scalar(Wrapping(42)),
         );
         let one = ResiduePolyF4Z128::from_scalar(Wrapping(1));

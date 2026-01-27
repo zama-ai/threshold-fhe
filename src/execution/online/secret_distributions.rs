@@ -3,7 +3,6 @@ use tracing::instrument;
 use super::preprocessing::BitPreprocessing;
 use crate::{
     algebra::structure_traits::Ring,
-    error::error_handler::anyhow_error_and_log,
     execution::{
         sharing::share::Share,
         tfhe_internals::parameters::{NoiseInfo, TUniformBound},
@@ -63,27 +62,27 @@ impl SecretDistributions for RealSecretDistributions {
         P: BitPreprocessing<Z> + Send + ?Sized,
     {
         let bound = bound.0;
-        let mut b = preproc.next_bit_vec(n * (bound + 2))?;
+        let required_bits = n * (bound + 2);
+
+        let mut b = preproc.next_bit_vec(required_bits)?;
 
         let mut res = Vec::with_capacity(n);
 
         //No need to compute indexes, simply pop the shared bits
         for _ in 1..=n {
             //Start with next_random_bit() - 2^bound
-            let mut ei = b
-                .pop()
-                .ok_or_else(|| anyhow_error_and_log("not enough bits in tuniform"))?
-                - Z::from_u128(1 << bound);
+            let first_bit = b.pop().expect("validated sufficient bits");
+            let mut ei = first_bit - Z::from_u128(1 << bound);
+
             //for j in [1,bound+1], add next_random_bit() << (j-1)
             //(could do j in [0,bound], but we keep it closer to NIST doc notation)
             for j in 1..=bound + 1 {
-                ei += b
-                    .pop()
-                    .ok_or_else(|| anyhow_error_and_log("not enough bits in tuniform"))?
-                    * Z::from_u128(1 << (j - 1));
+                let next_bit = b.pop().expect("validated sufficient bits");
+                ei += next_bit * (1 << (j - 1));
             }
             res.push(ei);
         }
+
         Ok(res)
     }
 
@@ -93,24 +92,25 @@ impl SecretDistributions for RealSecretDistributions {
         Z: Ring,
         P: BitPreprocessing<Z>,
     {
-        let mut b = preproc.next_bit_vec(2 * n * bound)?;
+        let required_bits = 2 * n * bound;
+
+        let mut b = preproc.next_bit_vec(required_bits)?;
+
         let mut res = Vec::with_capacity(n);
 
         //No need to compute indexes, simply pop the shared bits
         //adding bound times (next_random_bit() - next_random_bit())
         //i.e. if bound = 1, we have {-1,0,1} with probability {1/4 , 1/2, 1/4}
         for _ in 1..=n {
-            let mut e = b
-                .pop()
-                .ok_or_else(|| anyhow_error_and_log("not enough bits in newhope"))?
-                - b.pop()
-                    .ok_or_else(|| anyhow_error_and_log("not enough bits in newhope"))?;
+            // We've already validated we have enough bits, so these pops should never fail
+            let first_bit = b.pop().expect("validated sufficient bits");
+            let second_bit = b.pop().expect("validated sufficient bits");
+            let mut e = first_bit - second_bit;
+
             for _ in 1..bound {
-                e += b
-                    .pop()
-                    .ok_or_else(|| anyhow_error_and_log("not enough bits in newhope"))?
-                    - b.pop()
-                        .ok_or_else(|| anyhow_error_and_log("not enough bits in newhope"))?;
+                let next_bit1 = b.pop().expect("validated sufficient bits");
+                let next_bit2 = b.pop().expect("validated sufficient bits");
+                e += next_bit1 - next_bit2;
             }
             res.push(e);
         }
@@ -129,7 +129,10 @@ mod tests {
         },
         execution::{
             online::{preprocessing::dummy::DummyPreprocessing, triple::open_list},
-            runtime::session::{LargeSession, ParameterHandles, SmallSession},
+            runtime::sessions::{
+                large_session::LargeSession, session_parameters::GenericParameterHandles,
+                small_session::SmallSession,
+            },
         },
         networking::NetworkMode,
         tests::helper::tests_and_benches::{execute_protocol_large, execute_protocol_small},
@@ -137,15 +140,15 @@ mod tests {
 
     use super::{RealSecretDistributions, SecretDistributions, TUniformBound};
 
-    #[test]
-    fn test_newhope() {
+    #[tokio::test]
+    async fn test_newhope() {
         let parties = 5;
         let threshold = 1;
         let bound = 10; //NewHope(B) gives range [-10,10] with mean 0 and std deviation sqrt(5)
         let batch = 100;
 
         let mut task = |session: SmallSession<ResiduePolyF4Z64>, _bot: Option<String>| async move {
-            let mut preproc = DummyPreprocessing::<ResiduePolyF4Z64, _, _>::new(0, session.clone());
+            let mut preproc = DummyPreprocessing::<ResiduePolyF4Z64>::new(0, &session);
 
             let res_vec = RealSecretDistributions::newhope(batch, bound, &mut preproc).unwrap();
 
@@ -168,7 +171,8 @@ mod tests {
             Some(delay_vec),
             &mut task,
             None,
-        );
+        )
+        .await;
 
         //Ensure all values fall within bound
         let ref_res = results.first().unwrap();
@@ -185,23 +189,22 @@ mod tests {
     }
 
     // TODO these two test could be merged into a generic test and then just calles with Z64 and Z128 respectively.
-    #[test]
-    fn test_uniform_z128() {
+    #[tokio::test]
+    async fn test_uniform_z128() {
         let parties = 5;
         let threshold = 1;
         let bound = TUniformBound(2_usize);
         let batch = 100_usize;
 
         let mut task = |session: LargeSession| async move {
-            let mut large_preproc =
-                DummyPreprocessing::<ResiduePolyF4Z128, _, _>::new(0, session.clone());
+            let mut large_preproc = DummyPreprocessing::<ResiduePolyF4Z128>::new(0, &session);
 
             let res_vec =
                 RealSecretDistributions::t_uniform(batch, bound, &mut large_preproc).unwrap();
 
             let opened_res = open_list(&res_vec, &session).await.unwrap();
 
-            (session.my_role().unwrap(), opened_res)
+            (session.my_role(), opened_res)
         };
 
         // Rounds (only on the happy path here)
@@ -234,7 +237,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         //Check all parties agree and fall within expected bounds
         let ref_res = results[0].1.clone();
@@ -255,32 +259,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_uniform_z64() {
+    #[tokio::test]
+    async fn test_uniform_z64() {
         let parties = 5;
         let threshold = 1;
         let bound = TUniformBound(2_usize);
         let batch = 100_usize;
 
         let mut task = |session: LargeSession| async move {
-            //let mut large_preproc = RealLargePreprocessing::<ResiduePolyF4Z64>::init(
-            //    &mut session,
-            //    batch_sizes,
-            //    TrueSingleSharing::default(),
-            //    TrueDoubleSharing::default(),
-            //)
-            //.await
-            //.unwrap();
-
-            let mut large_preproc =
-                DummyPreprocessing::<ResiduePolyF4Z64, _, _>::new(0, session.clone());
+            let mut large_preproc = DummyPreprocessing::<ResiduePolyF4Z64>::new(0, &session);
 
             let res_vec =
                 RealSecretDistributions::t_uniform(batch, bound, &mut large_preproc).unwrap();
 
             let opened_res = open_list(&res_vec, &session).await.unwrap();
 
-            (session.my_role().unwrap(), opened_res)
+            (session.my_role(), opened_res)
         };
 
         // Rounds (only on the happy path here)
@@ -313,7 +307,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         //Check all parties agree and fall within expected bounds
         let ref_res = results[0].1.clone();

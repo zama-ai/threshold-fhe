@@ -2,15 +2,14 @@
 //! the kms-core (with the moby binary) parties to do benchmarks.
 //! It is a trusted entity and should not be used with production kms-core.
 use crate::choreography::grpc::gen::{
-    CrsGenRequest, CrsGenResultRequest, PreprocDecryptRequest, ThresholdDecryptRequest,
-    ThresholdKeyGenResultRequest,
+    CrsGenRequest, CrsGenResultRequest, PreprocDecryptRequest, ReshareRequest,
+    ThresholdDecryptRequest, ThresholdKeyGenResultRequest,
 };
 use crate::choreography::requests::CrsGenParams;
 use crate::conf::choreo::ChoreoConf;
-use crate::execution::endpoints::decryption::DecryptionMode;
-use crate::execution::endpoints::keygen::FhePubKeySet;
-use crate::execution::runtime::party::RoleAssignment;
-use crate::execution::tfhe_internals::parameters::{Ciphertext64, DkgParamsAvailable};
+use crate::execution::endpoints::decryption::{DecryptionMode, RadixOrBoolCiphertext};
+use crate::execution::tfhe_internals::parameters::DkgParamsAvailable;
+use crate::execution::tfhe_internals::public_keysets::FhePubKeySet;
 use crate::execution::zk::ceremony::compute_witness_dim;
 use crate::{
     algebra::base_ring::Z64,
@@ -22,8 +21,10 @@ use crate::{
     networking::constants::{MAX_EN_DECODE_MESSAGE_SIZE, NETWORK_TIMEOUT_LONG},
     session_id::SessionId,
 };
-use conf_trace::telemetry::ContextPropagator;
+use observability::telemetry::ContextPropagator;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tfhe::xof_key_set::CompressedXofKeySet;
 use tokio::{task::JoinSet, time::Duration};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Uri};
@@ -35,8 +36,9 @@ use super::grpc::gen::{
 };
 use super::grpc::SupportedRing;
 use super::requests::{
-    PreprocDecryptParams, PreprocKeyGenParams, PrssInitParams, SessionType, Status, TfheType,
-    ThresholdDecryptParams, ThresholdKeyGenParams, ThresholdKeyGenResultParams, ThroughtputParams,
+    PreprocDecryptParams, PreprocKeyGenParams, PrssInitParams, ReshareParams, SessionType, Status,
+    TfheType, ThresholdDecryptParams, ThresholdKeyGenParams, ThresholdKeyGenResultParams,
+    ThroughtputParams,
 };
 
 pub struct ChoreoRuntime {
@@ -52,11 +54,18 @@ pub struct GrpcOutputs {
 
 pub type NetworkTopology = HashMap<Role, Uri>;
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Serialize, Deserialize, Clone)]
+pub enum KeySetMaybeCompressed {
+    Compressed(CompressedXofKeySet),
+    Uncompressed(FhePubKeySet),
+}
+
 impl ChoreoRuntime {
     pub fn new_from_conf(conf: &ChoreoConf) -> Result<ChoreoRuntime, Box<dyn std::error::Error>> {
         let topology = &conf.threshold_topology;
 
-        let role_assignments: RoleAssignment = topology.into();
+        let role_assignments: HashMap<Role, Identity> = topology.into();
 
         // we need to set the protocol in URI correctly
         // depending on whether the certificates are present
@@ -73,9 +82,13 @@ impl ChoreoRuntime {
             .iter()
             .map(|(role, host)| {
                 let endpoint: &Uri = host;
-                tracing::debug!("connecting to endpoint: {:?}", endpoint);
+                println!("connecting to endpoint: {:?}", endpoint);
+                // Use the TLS_NODELAY mode to ensure everything gets sent immediately by disabling Nagle's algorithm.
+                // Note that this decreases latency but increases network bandwidth usage. If bandwidth is a concern,
+                // then this should be changed
                 let channel = Channel::builder(endpoint.clone())
                     .timeout(*NETWORK_TIMEOUT_LONG)
+                    .tcp_nodelay(true)
                     .connect_lazy();
                 Ok((*role, channel))
             })
@@ -103,15 +116,16 @@ impl ChoreoRuntime {
         ring: SupportedRing,
         threshold: u32,
         seed: Option<u64>,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<()> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
 
-        let prss_params = bincode::serialize(&PrssInitParams { session_id, ring })?;
+        let prss_params = bc2wrap::serialize(&PrssInitParams { session_id, ring })?;
 
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
-
+            let role = *role;
             let request = PrssInitRequest {
                 role_assignment: role_assignment.to_vec(),
                 threshold,
@@ -120,11 +134,18 @@ impl ChoreoRuntime {
             };
 
             join_set.spawn(
-                async move { client.prss_init(request).await }.instrument(tracing::Span::current()),
+                async move { (role, client.prss_init(request).await) }
+                    .instrument(tracing::Span::current()),
             );
         });
-        while let Some(response) = join_set.join_next().await {
-            response??;
+
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                response?;
+            }
         }
 
         Ok(())
@@ -140,9 +161,10 @@ impl ChoreoRuntime {
         percentage_offline: u32,
         threshold: u32,
         seed: Option<u64>,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<SessionId> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
-        let preproc_kg_params = bincode::serialize(&PreprocKeyGenParams {
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
+        let preproc_kg_params = bc2wrap::serialize(&PreprocKeyGenParams {
             session_type,
             session_id,
             percentage_offline,
@@ -151,8 +173,9 @@ impl ChoreoRuntime {
         })?;
 
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = PreprocKeyGenRequest {
                 role_assignment: role_assignment.to_vec(),
                 threshold,
@@ -161,14 +184,20 @@ impl ChoreoRuntime {
             };
 
             join_set.spawn(
-                async move { client.preproc_key_gen(request).await }
+                async move { (role, client.preproc_key_gen(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<SessionId> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner().request_id)).unwrap());
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses
+                    .push(bc2wrap::deserialize_safe(&(response?.into_inner().request_id)).unwrap());
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -187,17 +216,19 @@ impl ChoreoRuntime {
         session_id_preproc: Option<SessionId>,
         threshold: u32,
         seed: Option<u64>,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<SessionId> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
-        let threshold_keygen_params = bincode::serialize(&ThresholdKeyGenParams {
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
+        let threshold_keygen_params = bc2wrap::serialize(&ThresholdKeyGenParams {
             session_id,
             dkg_params: dkg_params.to_param(),
             session_id_preproc,
         })?;
 
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = ThresholdKeyGenRequest {
                 role_assignment: role_assignment.to_vec(),
                 threshold,
@@ -206,14 +237,20 @@ impl ChoreoRuntime {
             };
 
             join_set.spawn(
-                async move { client.threshold_key_gen(request).await }
+                async move { (role, client.threshold_key_gen(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<SessionId> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner().request_id)).unwrap());
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses
+                    .push(bc2wrap::deserialize_safe(&(response?.into_inner().request_id)).unwrap());
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -232,32 +269,39 @@ impl ChoreoRuntime {
         session_id: SessionId,
         dkg_params: Option<DkgParamsAvailable>,
         seed: Option<u64>,
-    ) -> anyhow::Result<FhePubKeySet> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
+        malicious_roles: Vec<Role>,
+    ) -> anyhow::Result<KeySetMaybeCompressed> {
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
 
-        let threshold_keygen_result_params = bincode::serialize(&ThresholdKeyGenResultParams {
+        let threshold_keygen_result_params = bc2wrap::serialize(&ThresholdKeyGenResultParams {
             session_id,
             dkg_params: dkg_params.map_or_else(|| None, |v| Some(v.to_param())),
         })?;
 
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = ThresholdKeyGenResultRequest {
                 role_assignment: role_assignment.to_vec(),
                 params: threshold_keygen_result_params.to_vec(),
                 seed,
             };
             join_set.spawn(
-                async move { client.threshold_key_gen_result(request).await }
+                async move { (role, client.threshold_key_gen_result(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            let response = response??.into_inner();
-            responses.push(response.pub_keyset);
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                let response = response?.into_inner();
+                responses.push(response.pub_keyset);
+            }
         }
 
         //NOTE: Cant really assert here as keys dont implement eq trait, and cant assert eq on serialized data
@@ -266,7 +310,15 @@ impl ChoreoRuntime {
         //    assert_eq!(response, ref_response);
         //}
         let pub_key = responses.pop().unwrap();
-        let pub_key = bincode::deserialize(&pub_key)?;
+        // First try to deserialize into a compressed keyset
+        // if it fails, try to deserialize into uncompressed keyset
+        let pub_key = match bc2wrap::deserialize_safe::<CompressedXofKeySet>(&pub_key) {
+            Ok(keyset) => KeySetMaybeCompressed::Compressed(keyset),
+            Err(_) => {
+                let keyset = bc2wrap::deserialize_safe::<FhePubKeySet>(&pub_key)?;
+                KeySetMaybeCompressed::Uncompressed(keyset)
+            }
+        };
         Ok(pub_key)
     }
 
@@ -280,9 +332,10 @@ impl ChoreoRuntime {
         ctxt_type: TfheType,
         threshold: u32,
         seed: Option<u64>,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<SessionId> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
-        let preproc_decrypt_params = bincode::serialize(&PreprocDecryptParams {
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
+        let preproc_decrypt_params = bc2wrap::serialize(&PreprocDecryptParams {
             session_id,
             key_sid,
             decryption_mode,
@@ -291,8 +344,9 @@ impl ChoreoRuntime {
         })?;
 
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = PreprocDecryptRequest {
                 role_assignment: role_assignment.to_vec(),
                 threshold,
@@ -301,14 +355,20 @@ impl ChoreoRuntime {
             };
 
             join_set.spawn(
-                async move { client.preproc_decrypt(request).await }
+                async move { (role, client.preproc_decrypt(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<SessionId> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner().request_id)).unwrap());
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses
+                    .push(bc2wrap::deserialize_safe(&(response?.into_inner().request_id)).unwrap());
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -327,14 +387,15 @@ impl ChoreoRuntime {
         key_sid: SessionId,
         decryption_mode: DecryptionMode,
         preproc_sid: Option<SessionId>,
-        ctxts: Vec<Ciphertext64>,
+        ctxts: Vec<RadixOrBoolCiphertext>,
         throughput: Option<ThroughtputParams>,
         tfhe_type: TfheType,
         threshold: u32,
         seed: Option<u64>,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<SessionId> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
-        let threshold_decrypt_params = bincode::serialize(&ThresholdDecryptParams {
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
+        let threshold_decrypt_params = bc2wrap::serialize(&ThresholdDecryptParams {
             session_id,
             decryption_mode,
             key_sid,
@@ -345,8 +406,9 @@ impl ChoreoRuntime {
         })?;
 
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = ThresholdDecryptRequest {
                 role_assignment: role_assignment.to_vec(),
                 threshold,
@@ -355,14 +417,20 @@ impl ChoreoRuntime {
             };
 
             join_set.spawn(
-                async move { client.threshold_decrypt(request).await }
+                async move { (role, client.threshold_decrypt(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<SessionId> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner().request_id)).unwrap());
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses
+                    .push(bc2wrap::deserialize_safe(&(response?.into_inner().request_id)).unwrap());
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -377,24 +445,33 @@ impl ChoreoRuntime {
     pub async fn initiate_threshold_decrypt_result(
         &self,
         session_id: SessionId,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<Vec<Z64>> {
         let mut join_set = JoinSet::new();
-        let serialized_sid = bincode::serialize(&session_id)?;
-        self.channels.values().for_each(|channel| {
+        let serialized_sid = bc2wrap::serialize(&session_id)?;
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = ThresholdDecryptResultRequest {
                 request_id: serialized_sid.to_vec(),
             };
 
             join_set.spawn(
-                async move { client.threshold_decrypt_result(request).await }
+                async move { (role, client.threshold_decrypt_result(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<Vec<Z64>> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner().plaintext))?);
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses.push(bc2wrap::deserialize_safe(
+                    &(response?.into_inner().plaintext),
+                )?);
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -412,8 +489,9 @@ impl ChoreoRuntime {
         dkg_params: DkgParamsAvailable,
         threshold: u32,
         seed: Option<u64>,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<SessionId> {
-        let role_assignment = bincode::serialize(&self.role_assignments)?;
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
         let witness_dim = compute_witness_dim(
             &dkg_params
                 .to_param()
@@ -421,15 +499,16 @@ impl ChoreoRuntime {
                 .get_compact_pk_enc_params(),
             None,
         )? as u128;
-        let crs_gen_params = bincode::serialize(&CrsGenParams {
+        let crs_gen_params = bc2wrap::serialize(&CrsGenParams {
             session_id,
             witness_dim,
         })?;
 
         let mut join_set = JoinSet::new();
 
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = CrsGenRequest {
                 role_assignment: role_assignment.to_vec(),
                 threshold,
@@ -439,13 +518,20 @@ impl ChoreoRuntime {
             };
 
             join_set.spawn(
-                async move { client.crs_gen(request).await }.instrument(tracing::Span::current()),
+                async move { (role, client.crs_gen(request).await) }
+                    .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<SessionId> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner().request_id)).unwrap());
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses
+                    .push(bc2wrap::deserialize_safe(&(response?.into_inner().request_id)).unwrap());
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -460,24 +546,31 @@ impl ChoreoRuntime {
     pub async fn initiate_crs_gen_result(
         &self,
         session_id: SessionId,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<InternalPublicParameter> {
-        let serialized_sid = bincode::serialize(&session_id)?;
+        let serialized_sid = bc2wrap::serialize(&session_id)?;
         let mut join_set = JoinSet::new();
-        self.channels.values().for_each(|channel| {
+        self.channels.iter().for_each(|(role, channel)| {
             let mut client = self.new_client(channel.clone());
+            let role = *role;
             let request = CrsGenResultRequest {
                 request_id: serialized_sid.to_vec(),
             };
 
             join_set.spawn(
-                async move { client.crs_gen_result(request).await }
+                async move { (role, client.crs_gen_result(request).await) }
                     .instrument(tracing::Span::current()),
             );
         });
 
         let mut responses: Vec<InternalPublicParameter> = Vec::new();
-        while let Some(response) = join_set.join_next().await {
-            responses.push(bincode::deserialize(&(response??.into_inner()).crs).unwrap());
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses.push(bc2wrap::deserialize_safe(&(response?.into_inner()).crs).unwrap());
+            }
         }
 
         let ref_response = responses.first().unwrap();
@@ -487,14 +580,69 @@ impl ChoreoRuntime {
         Ok(ref_response.clone())
     }
 
+    #[instrument(name = "Reshare Request", skip(self,old_key_sid,new_key_sid),fields(old_sid=?old_key_sid, sid=?new_key_sid))]
+    pub async fn initiate_reshare(
+        &self,
+        threshold: u32,
+        old_key_sid: SessionId,
+        new_key_sid: SessionId,
+        session_type: SessionType,
+        seed: Option<u64>,
+        malicious_roles: Vec<Role>,
+    ) -> anyhow::Result<SessionId> {
+        let role_assignment = bc2wrap::serialize(&self.role_assignments)?;
+        let reshare_params_serialized = bc2wrap::serialize(&ReshareParams {
+            session_type,
+            old_key_sid,
+            new_key_sid,
+        })?;
+
+        let mut join_set = JoinSet::new();
+
+        self.channels.iter().for_each(|(role, channel)| {
+            let mut client = self.new_client(channel.clone());
+            let role = *role;
+            let request = ReshareRequest {
+                role_assignment: role_assignment.clone(),
+                threshold,
+                params: reshare_params_serialized.clone(),
+                seed,
+            };
+
+            join_set.spawn(
+                async move { (role, client.reshare(request).await) }
+                    .instrument(tracing::Span::current()),
+            );
+        });
+
+        let mut responses: Vec<SessionId> = Vec::new();
+        while let Some(Ok((role, response))) = join_set.join_next().await {
+            if malicious_roles.contains(&role) {
+                println!("Malicious role {role} detected, skipping response.");
+                continue;
+            } else {
+                responses
+                    .push(bc2wrap::deserialize_safe(&(response?.into_inner().request_id)).unwrap());
+            }
+        }
+
+        let ref_response = responses.first().unwrap();
+        for response in responses.iter() {
+            assert_eq!(ref_response, response)
+        }
+
+        Ok(*ref_response)
+    }
+
     pub async fn initiate_status_check(
         &self,
         session_id: SessionId,
         retry: bool,
         interval: Duration,
+        malicious_roles: Vec<Role>,
     ) -> anyhow::Result<Vec<(Role, Status)>> {
         let mut join_set = JoinSet::new();
-        let serialized_sid = bincode::serialize(&session_id)?;
+        let serialized_sid = bc2wrap::serialize(&session_id)?;
         let request = StatusCheckRequest {
             request_id: serialized_sid,
         };
@@ -510,17 +658,21 @@ impl ChoreoRuntime {
 
             while let Some(response) = join_set.join_next().await {
                 let (role, response) = response?;
-                let status: Status = bincode::deserialize(&response?.into_inner().status)?;
+                let status: Status = bc2wrap::deserialize_safe(&response?.into_inner().status)?;
                 result.push((role, status));
             }
 
-            if !retry || result.iter().all(|(_, status)| *status != Status::Ongoing) {
+            if !retry
+                || result.iter().all(|(role, status)| {
+                    *status != Status::Ongoing || malicious_roles.contains(role)
+                })
+            {
                 return Ok(result);
             } else {
                 println!("Status Check for Session ID {session_id} -- Still have running parties");
                 result.sort_by_key(|(role, _)| role.one_based());
                 for (role, status) in result.drain(..) {
-                    println!("Role {role}, Status {:?}", status);
+                    println!("Role {role}, Status {status:?}");
                 }
                 tokio::time::sleep(interval).await;
             }

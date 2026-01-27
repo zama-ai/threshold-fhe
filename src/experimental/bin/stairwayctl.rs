@@ -1,13 +1,15 @@
 //! CLI tool for interacting with a group of stairways
+//! It is not really an issue to have "unsafe" code here (e.g. unsafe deserialization)
+//! as this is meant for testing and benchmarking, and definitely not for production use.
 use tokio::time::{self, Duration};
 
 use aes_prng::AesRng;
 use clap::{Args, Parser, Subcommand};
-use conf_trace::{
+use itertools::Itertools;
+use observability::{
     conf::{Settings, TelemetryConfig},
     telemetry::init_tracing,
 };
-use itertools::Itertools;
 use rand::{random, RngCore, SeedableRng};
 use threshold_fhe::{
     choreography::choreographer::ChoreoRuntime,
@@ -184,11 +186,11 @@ async fn prss_init_command(
     choreo_conf: &ChoreoConf,
     params: PrssInitArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = params.session_id.unwrap_or(random());
+    let session_id = params.session_id.unwrap_or_else(random);
 
     runtime
         .bgv_inititate_prss_init(
-            SessionId(session_id),
+            SessionId::from(session_id),
             params.ring,
             choreo_conf.threshold_topology.threshold,
             params.seed,
@@ -204,11 +206,11 @@ async fn preproc_keygen_command(
     choreo_conf: ChoreoConf,
     params: PreprocKeyGenArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = params.session_id.unwrap_or(random());
+    let session_id = params.session_id.unwrap_or_else(random);
 
     let session_id = runtime
         .bgv_initiate_preproc_keygen(
-            SessionId(session_id),
+            SessionId::from(session_id),
             params.num_sessions_preproc,
             choreo_conf.threshold_topology.threshold,
             params.seed,
@@ -224,14 +226,14 @@ async fn threshold_keygen_command(
     choreo_conf: ChoreoConf,
     params: ThresholdKeyGenArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = params.session_id.unwrap_or(random());
+    let session_id = params.session_id.unwrap_or_else(random);
 
     let session_id = runtime
         .bgv_initiate_threshold_keygen(
-            SessionId(session_id),
+            SessionId::from(session_id),
             params
                 .session_id_preproc
-                .map_or_else(|| None, |id| Some(SessionId(id))),
+                .map_or_else(|| None, |id| Some(SessionId::from(id))),
             choreo_conf.threshold_topology.threshold,
             params.seed,
         )
@@ -247,13 +249,13 @@ async fn threshold_keygen_result_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let keys = runtime
         .bgv_initiate_threshold_keygen_result(
-            SessionId(params.session_id),
+            SessionId::from(params.session_id),
             params.params,
             params.seed,
         )
         .await?;
 
-    let serialized_pk = bincode::serialize(&(params.session_id, keys))?;
+    let serialized_pk = bc2wrap::serialize(&(params.session_id, keys))?;
     std::fs::write(format!("{}/pk.bin", params.storage_path), serialized_pk)?;
     println!("Key stored in {}/pk.bin", params.storage_path);
     Ok(())
@@ -273,7 +275,7 @@ async fn threshold_decrypt_command(
     let num_sessions = params.num_parallel_sessions;
     let pk_serialized = std::fs::read(params.pub_key_file)?;
     let (key_sid, pk): (SessionId, PublicKey<LevelEll, LevelKsw, N65536>) =
-        bincode::deserialize(&pk_serialized)?;
+        bc2wrap::deserialize_unsafe(&pk_serialized)?;
 
     let mut rng = AesRng::from_entropy();
     let ms = (0..num_sessions)
@@ -288,12 +290,12 @@ async fn threshold_decrypt_command(
         .map(|i| bgv_pk_encrypt(&mut rng, &ms[i], &pk))
         .collect_vec();
 
-    println!("Encrypted the following messages : {:?}", ms);
+    println!("Encrypted the following messages : {ms:?}");
 
-    let session_id = params.session_id.unwrap_or(random());
+    let session_id = params.session_id.unwrap_or_else(random);
     let session_id = runtime
         .bgv_initiate_threshold_decrypt(
-            SessionId(session_id),
+            SessionId::from(session_id),
             key_sid,
             ciphertexts,
             num_ctxt_per_session as usize,
@@ -303,8 +305,7 @@ async fn threshold_decrypt_command(
         .await?;
 
     println!(
-        "Distributed Decryption started. The resulting plaintexts will be stored under session ID: {:?}",
-        session_id
+        "Distributed Decryption started. The resulting plaintexts will be stored under session ID: {session_id:?}"
     );
     Ok(())
 }
@@ -314,7 +315,7 @@ async fn threshold_decrypt_result_command(
     params: ThresholdDecryptResultArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ptxts = runtime
-        .bgv_initiate_threshold_decrypt_result(SessionId(params.session_id_decrypt))
+        .bgv_initiate_threshold_decrypt_result(SessionId::from(params.session_id_decrypt))
         .await?;
 
     println!(
@@ -326,21 +327,27 @@ async fn threshold_decrypt_result_command(
 
 async fn status_check_command(
     runtime: ChoreoRuntime,
+    choreo_conf: ChoreoConf,
     params: StatusCheckArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = SessionId(params.session_id);
-    let retry = params.retry.map_or_else(|| false, |val| val);
+    let session_id = SessionId::from(params.session_id);
+    let retry = params.retry.unwrap_or(false);
     let interval = params
         .interval
         .map_or_else(|| Duration::from_secs(10), Duration::from_secs);
     let mut results = runtime
-        .initiate_status_check(session_id, retry, interval)
+        .initiate_status_check(
+            session_id,
+            retry,
+            interval,
+            choreo_conf.malicious_roles.unwrap_or_default(),
+        )
         .await?;
 
     results.sort_by_key(|(role, _)| role.one_based());
     println!("Status Check for Session ID {session_id} -- Finished");
     for (role, status) in results {
-        println!("Role {role}, Status {:?}", status);
+        println!("Role {role}, Status {status:?}");
     }
     Ok(())
 }
@@ -355,13 +362,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .init_conf()?;
 
-    let telemetry = conf.telemetry.clone().unwrap_or(
+    let telemetry = conf.telemetry.clone().unwrap_or_else(|| {
         TelemetryConfig::builder()
             .tracing_service_name("stairwayctl".to_string())
-            .build(),
-    );
+            .build()
+    });
 
-    init_tracing(&telemetry)?;
+    let tracer_provider = init_tracing(&telemetry).await?;
 
     let runtime = ChoreoRuntime::new_from_conf(&conf)?;
     match args.command {
@@ -384,12 +391,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             threshold_decrypt_result_command(runtime, params).await?;
         }
         Commands::StatusCheck(params) => {
-            status_check_command(runtime, params).await?;
+            status_check_command(runtime, conf, params).await?;
         }
     };
 
     //Sleep to let some time for the process to export all the spans before exit
     time::sleep(tokio::time::Duration::from_secs(5)).await;
-    opentelemetry::global::shutdown_tracer_provider();
+
+    // Explicitly shut down telemetry to ensure all data is properly exported
+    if let Err(e) = tracer_provider.shutdown() {
+        eprintln!("Error shutting down tracer provider: {e}");
+    }
+
     Ok(())
 }

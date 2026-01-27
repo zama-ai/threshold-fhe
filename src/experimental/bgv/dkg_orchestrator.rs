@@ -1,11 +1,11 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use itertools::Itertools;
 use num_integer::div_ceil;
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender},
-        Mutex,
+        Mutex, RwLock,
     },
     task::JoinSet,
 };
@@ -25,19 +25,23 @@ use crate::{
                         triples_aggregator::TriplesAggregator,
                     },
                     dkg_orchestrator::create_channels,
+                    producer_traits::{BitProducerTrait, RandomProducerTrait, TripleProducerTrait},
                     producers::{
-                        bits_producer::SmallSessionBitProducer, common::execute_preprocessing,
-                        randoms_producer::SmallSessionRandomProducer,
-                        triples_producer::SmallSessionTripleProducer,
+                        bits_producer::SecureSmallSessionBitProducer,
+                        common::execute_preprocessing,
+                        randoms_producer::SecureSmallSessionRandomProducer,
+                        triples_producer::SecureSmallSessionTripleProducer,
                     },
                     progress_tracker::ProgressTracker,
                 },
             },
             secret_distributions::{RealSecretDistributions, SecretDistributions},
         },
-        runtime::session::{ParameterHandles, SmallSession},
+        runtime::sessions::{
+            session_parameters::GenericParameterHandles, small_session::SmallSession,
+        },
         sharing::share::Share,
-        small_execution::{agree_random::RealAgreeRandom, offline::SmallPreprocessing},
+        small_execution::offline::{Preprocessing, SecureSmallPreprocessing},
     },
     experimental::{
         algebra::levels::LevelKsw,
@@ -150,7 +154,7 @@ impl BGVPreprocessingOrchestrator {
         joinset_processors.spawn(bit_processor.run().instrument(current_span.clone()));
 
         //Start the producers
-        let triple_producer = SmallSessionTripleProducer::new(
+        let triple_producer = SecureSmallSessionTripleProducer::new(
             BGV_BATCH_SIZE_TRIPLES,
             num_triples,
             triple_sessions,
@@ -159,7 +163,7 @@ impl BGVPreprocessingOrchestrator {
         )?;
         let mut triple_producer_handles = triple_producer.start_triple_production();
 
-        let randomness_producer = SmallSessionRandomProducer::new(
+        let randomness_producer = SecureSmallSessionRandomProducer::new(
             BGV_BATCH_SIZE_RANDOMS,
             num_randomness,
             randomness_sessions,
@@ -168,7 +172,7 @@ impl BGVPreprocessingOrchestrator {
         )?;
         let mut randomness_producer_handles = randomness_producer.start_random_production();
 
-        let bit_producer = SmallSessionBitProducer::new(
+        let bit_producer = SecureSmallSessionBitProducer::new(
             BGV_BATCH_SIZE_BITS,
             num_bits,
             sessions,
@@ -198,9 +202,7 @@ impl BGVPreprocessingOrchestrator {
         let dkg_preproc_return = Arc::into_inner(self.dkg_preproc).ok_or_else(|| {
             anyhow_error_and_log("Error getting hold of dkg preprocessing store inside the Arc")
         })?;
-        let dkg_preproc_return = dkg_preproc_return.into_inner().map_err(|_| {
-            anyhow_error_and_log("Error consuming dkg preprocessing inside the Lock")
-        })?;
+        let dkg_preproc_return = dkg_preproc_return.into_inner();
         Ok((res_sessions, dkg_preproc_return))
     }
 }
@@ -264,15 +266,14 @@ impl BGVDkgBitProcessor {
                     .collect(),
             };
 
-            (*self
-                .output_writer
+            self.output_writer
                 .write()
-                .map_err(|e| anyhow_error_and_log(format!("Locking Error: {e}")))?)
-            .append_ternary(RealSecretDistributions::newhope(
-                num_ternary,
-                1,
-                &mut bit_preproc,
-            )?);
+                .await
+                .append_ternary(RealSecretDistributions::newhope(
+                    num_ternary,
+                    1,
+                    &mut bit_preproc,
+                )?);
             self.num_ternary -= num_ternary;
         }
 
@@ -306,22 +307,21 @@ impl BGVDkgBitProcessor {
                 available_bits: bit_batch.drain(..num_noise * noise_required_bits).collect(),
             };
 
-            (*self
-                .output_writer
+            self.output_writer
                 .write()
-                .map_err(|e| anyhow_error_and_log(format!("Locking Error: {e}")))?)
-            .append_noise(RealSecretDistributions::newhope(
-                num_noise,
-                NEW_HOPE_BOUND,
-                &mut bit_preproc,
-            )?);
+                .await
+                .append_noise(RealSecretDistributions::newhope(
+                    num_noise,
+                    NEW_HOPE_BOUND,
+                    &mut bit_preproc,
+                )?);
             self.num_noise -= num_noise;
         }
         Ok(())
     }
 }
 
-impl SmallSessionBitProducer<LevelKsw> {
+impl SecureSmallSessionBitProducer<LevelKsw> {
     #[instrument(name="Bit Odd Factory",skip(self),fields(num_sessions= ?self.producers.len()))]
     pub fn start_bit_gen_odd_production(
         self,
@@ -339,13 +339,15 @@ impl SmallSessionBitProducer<LevelKsw> {
             };
 
             for _ in 0..num_loops {
-                let mut preproc = SmallPreprocessing::<LevelKsw, RealAgreeRandom>::init(
+                let mut correlated_randomness = SecureSmallPreprocessing::default()
+                    .execute(&mut session, base_batch_size)
+                    .await?;
+                let bits = RealBitGenOdd::gen_bits_odd(
+                    batch_size,
+                    &mut correlated_randomness,
                     &mut session,
-                    base_batch_size,
                 )
                 .await?;
-                let bits =
-                    RealBitGenOdd::gen_bits_odd(batch_size, &mut preproc, &mut session).await?;
 
                 //Drop the error on purpose as the receiver end might be closed already if we produced too much
                 let _ = sender_channel.send(bits).await;

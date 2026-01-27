@@ -1,39 +1,53 @@
+use itertools::Itertools;
 use num_integer::div_ceil;
 use tokio::{sync::mpsc::Sender, task::JoinSet};
 use tracing::instrument;
 
 use crate::{
-    algebra::structure_traits::{Derive, ErrorCorrect, Invert},
+    algebra::structure_traits::Ring,
     error::error_handler::anyhow_error_and_log,
     execution::{
         config::BatchParams,
-        large_execution::offline::{LargePreprocessing, TrueDoubleSharing, TrueSingleSharing},
+        large_execution::offline::SecureLargePreprocessing,
         online::preprocessing::{
-            orchestration::progress_tracker::ProgressTracker, RandomPreprocessing,
+            orchestration::{
+                producer_traits::RandomProducerTrait, progress_tracker::ProgressTracker,
+            },
+            RandomPreprocessing,
         },
-        runtime::session::{LargeSession, ParameterHandles, SmallSession},
+        runtime::sessions::{
+            base_session::BaseSessionHandles, large_session::LargeSession,
+            small_session::SmallSession,
+        },
         sharing::share::Share,
-        small_execution::{
-            agree_random::RealAgreeRandom, offline::SmallPreprocessing, prf::PRSSConversions,
-        },
+        small_execution::offline::{Preprocessing, SecureSmallPreprocessing},
     },
 };
 
-use super::common::{execute_preprocessing, ProducerLargeSession, ProducerSmallSession};
+use super::common::{execute_preprocessing, ProducerSession};
 
-/// Produces randomness in all session concurrently
-pub struct SmallSessionRandomProducer<Z: PRSSConversions + ErrorCorrect + Invert> {
+pub struct GenericRandomProducer<Z, S, PreprocStrat>
+where
+    Z: Ring,
+    S: BaseSessionHandles + 'static,
+{
     batch_size: usize,
     total_size: usize,
-    producers: Vec<ProducerSmallSession<Z, Vec<Share<Z>>>>,
+    producers: Vec<ProducerSession<S, Vec<Share<Z>>>>,
     progress_tracker: Option<ProgressTracker>,
+    _marker_strat: std::marker::PhantomData<PreprocStrat>,
 }
 
-impl<Z: PRSSConversions + ErrorCorrect + Invert> SmallSessionRandomProducer<Z> {
-    pub fn new(
+impl<Z, S, PreprocStrat> RandomProducerTrait<Z, S> for GenericRandomProducer<Z, S, PreprocStrat>
+where
+    Z: Ring,
+    S: BaseSessionHandles + 'static,
+    PreprocStrat: Preprocessing<Z, S> + Default,
+{
+    fn new(
         batch_size: usize,
         total_size: usize,
-        mut sessions: Vec<SmallSession<Z>>,
+        mut sessions: Vec<S>,
         channels: Vec<Sender<Vec<Share<Z>>>>,
         progress_tracker: Option<ProgressTracker>,
     ) -> anyhow::Result<Self> {
@@ -46,8 +60,8 @@ impl<Z: PRSSConversions + ErrorCorrect + Invert> SmallSessionRandomProducer<Z> {
 
         let producers = sessions
             .into_iter()
-            .zip(channels)
-            .map(|(session, channel)| ProducerSmallSession::new(session, channel))
+            .zip_eq(channels)
+            .map(|(session, channel)| ProducerSession::new(session, channel))
             .collect();
 
         Ok(Self {
@@ -55,16 +69,17 @@ impl<Z: PRSSConversions + ErrorCorrect + Invert> SmallSessionRandomProducer<Z> {
             total_size,
             producers,
             progress_tracker,
+            _marker_strat: std::marker::PhantomData,
         })
     }
 
     #[instrument(name="Random Factory",skip(self),fields(num_sessions= ?self.producers.len()))]
-    pub fn start_random_production(self) -> JoinSet<Result<SmallSession<Z>, anyhow::Error>> {
+    fn start_random_production(self) -> JoinSet<Result<S, anyhow::Error>> {
         let num_producers = self.producers.len();
         let num_loops = div_ceil(self.total_size, self.batch_size * num_producers);
 
         let batch_size = self.batch_size;
-        let task_gen = |mut session: SmallSession<Z>,
+        let task_gen = |mut session: S,
                         sender_channel: Sender<Vec<Share<Z>>>,
                         progress_tracker: Option<ProgressTracker>| async move {
             let base_batch_size = BatchParams {
@@ -72,11 +87,12 @@ impl<Z: PRSSConversions + ErrorCorrect + Invert> SmallSessionRandomProducer<Z> {
                 randoms: batch_size,
             };
 
+            let mut preprocessing = PreprocStrat::default();
             for _ in 0..num_loops {
-                let randoms =
-                    SmallPreprocessing::<Z, RealAgreeRandom>::init(&mut session, base_batch_size)
-                        .await?
-                        .next_random_vec(batch_size)?;
+                let randoms = preprocessing
+                    .execute(&mut session, base_batch_size)
+                    .await?
+                    .next_random_vec(batch_size)?;
 
                 //Drop the error on purpose as the receiver end might be closed already if we produced too much
                 let _ = sender_channel.send(randoms).await;
@@ -88,80 +104,15 @@ impl<Z: PRSSConversions + ErrorCorrect + Invert> SmallSessionRandomProducer<Z> {
     }
 }
 
-/// Produces randomness in all session concurrently
-pub struct LargeSessionRandomProducer<Z: ErrorCorrect + Invert + Derive> {
-    batch_size: usize,
-    total_size: usize,
-    producers: Vec<ProducerLargeSession<Vec<Share<Z>>>>,
-    progress_tracker: Option<ProgressTracker>,
-}
+pub type SecureSmallSessionRandomProducer<Z> =
+    GenericRandomProducer<Z, SmallSession<Z>, SecureSmallPreprocessing>;
 
-impl<Z: ErrorCorrect + Invert + Derive> LargeSessionRandomProducer<Z> {
-    pub fn new(
-        batch_size: usize,
-        total_size: usize,
-        mut sessions: Vec<LargeSession>,
-        channels: Vec<Sender<Vec<Share<Z>>>>,
-        progress_tracker: Option<ProgressTracker>,
-    ) -> anyhow::Result<Self> {
-        if sessions.len() != channels.len() {
-            return Err(anyhow_error_and_log(format!("Trying to instantiate a producer with {} sessions and {} channels, but we need as many sessions as channels",sessions.len(), channels.len())));
-        }
-
-        //Always sort the sessions by sid so we are sure it's order the same way for all parties
-        sessions.sort_by_key(|s| s.session_id());
-
-        let producers = sessions
-            .into_iter()
-            .zip(channels)
-            .map(|(session, channel)| ProducerLargeSession::new(session, channel))
-            .collect();
-
-        Ok(Self {
-            batch_size,
-            total_size,
-            producers,
-            progress_tracker,
-        })
-    }
-
-    #[instrument(name="Random Factory",skip(self),fields(num_sessions= ?self.producers.len()))]
-    pub fn start_random_production(self) -> JoinSet<Result<LargeSession, anyhow::Error>> {
-        let num_producers = self.producers.len();
-        let num_loops = div_ceil(self.total_size, self.batch_size * num_producers);
-
-        let batch_size = self.batch_size;
-        let task_gen = |mut session: LargeSession,
-                        sender_channel: Sender<Vec<Share<Z>>>,
-                        progress_tracker: Option<ProgressTracker>| async move {
-            let base_batch_size = BatchParams {
-                triples: 0,
-                randoms: batch_size,
-            };
-
-            for _ in 0..num_loops {
-                let randoms = LargePreprocessing::<Z, _, _>::init(
-                    &mut session,
-                    base_batch_size,
-                    TrueSingleSharing::default(),
-                    TrueDoubleSharing::default(),
-                )
-                .await?
-                .next_random_vec(batch_size)?;
-
-                //Drop the error on purpose as the receiver end might be closed already if we produced too much
-                let _ = sender_channel.send(randoms).await;
-                progress_tracker.as_ref().map(|p| p.increment(batch_size));
-            }
-            Ok::<_, anyhow::Error>(session)
-        };
-        execute_preprocessing(self.producers, task_gen, self.progress_tracker)
-    }
-}
+pub type SecureLargeSessionRandomProducer<Z> =
+    GenericRandomProducer<Z, LargeSession, SecureLargePreprocessing<Z>>;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use itertools::Itertools;
 
@@ -180,7 +131,7 @@ mod tests {
                 },
                 RandomPreprocessing,
             },
-            runtime::party::Identity,
+            runtime::party::Role,
             sharing::shamir::{RevealOp, ShamirSharings},
         },
     };
@@ -189,7 +140,7 @@ mod tests {
         all_parties_channels: Vec<
             ReceiverChannelCollectionWithTracker<ResiduePoly<Z64, EXTENSION_DEGREE>>,
         >,
-        identities: &[Identity],
+        roles: &HashSet<Role>,
         num_randomness: usize,
         threshold: usize,
     ) where
@@ -216,23 +167,19 @@ mod tests {
 
         //Retrieve bits and try reconstruct them
         let mut randomness_map = HashMap::new();
-        for ((party_idx, _party_id), random_preproc) in identities
-            .iter()
-            .enumerate()
-            .zip(random_preprocs.iter_mut())
-        {
+        for (party, random_preproc) in roles.iter().zip(random_preprocs.iter_mut()) {
             let randomness_len = random_preproc.randoms_len();
             assert_eq!(randomness_len, num_randomness);
 
             let randomness_shares = random_preproc.next_random_vec(num_randomness).unwrap();
 
-            randomness_map.insert(party_idx + 1, randomness_shares);
+            randomness_map.insert(party, randomness_shares);
         }
 
         let mut vec_sharings = vec![ShamirSharings::default(); num_randomness];
         for (_, randomness) in randomness_map {
             for (idx, bit) in randomness.iter().enumerate() {
-                let _ = vec_sharings[idx].add_share(*bit);
+                vec_sharings[idx].add_share(*bit);
             }
         }
 
@@ -291,7 +238,7 @@ mod tests {
         //Want 1k, so each session needs running twice (5 sessions, each batch is 100)
         let num_randomness = num_sessions * batch_size * TEST_NUM_LOOP;
 
-        let (identities, all_parties_channels) = test_production_large::<EXTENSION_DEGREE>(
+        let (roles, all_parties_channels) = test_production_large::<EXTENSION_DEGREE>(
             num_sessions as u128,
             num_randomness,
             batch_size,
@@ -302,7 +249,7 @@ mod tests {
 
         check_randomness_reconstruction(
             all_parties_channels,
-            &identities,
+            &roles,
             num_randomness,
             threshold as usize,
         );
@@ -358,7 +305,7 @@ mod tests {
         //Want 1k, so each session needs running twice (5 sessions, each batch is 100)
         let num_randomness = num_sessions * batch_size * TEST_NUM_LOOP;
 
-        let (identities, all_parties_channels) = test_production_small::<EXTENSION_DEGREE>(
+        let (roles, all_parties_channels) = test_production_small::<EXTENSION_DEGREE>(
             num_sessions as u128,
             num_randomness,
             batch_size,
@@ -369,7 +316,7 @@ mod tests {
 
         check_randomness_reconstruction(
             all_parties_channels,
-            &identities,
+            &roles,
             num_randomness,
             threshold as usize,
         );

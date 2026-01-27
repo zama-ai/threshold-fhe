@@ -1,10 +1,11 @@
+use itertools::Itertools;
 use tfhe::{
-    core_crypto::commons::traits::ByteRandomGenerator, shortint::parameters::PolynomialSize,
+    core_crypto::commons::traits::ParallelByteRandomGenerator, shortint::parameters::PolynomialSize,
 };
 
 use crate::algebra::{
     galois_rings::common::ResiduePoly,
-    structure_traits::{BaseRing, Ring, Zero},
+    structure_traits::{BaseRing, ErrorCorrect, Zero},
 };
 
 use super::{
@@ -77,11 +78,10 @@ pub fn encrypt_glwe_ciphertext_assign<Gen, Z, const EXTENSION_DEGREE: usize>(
     glwe_secret_key_share: &GlweSecretKeyShare<Z, EXTENSION_DEGREE>,
     output: &mut GlweCiphertextShare<Z, EXTENSION_DEGREE>,
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
-) -> anyhow::Result<()>
-where
-    Gen: ByteRandomGenerator,
+) where
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     let encryption_type = output.encryption_type;
     let (mask, body) = output.get_mut_mask_and_body();
@@ -101,11 +101,10 @@ pub fn encrypt_glwe_ciphertext<Gen, Z, const EXTENSION_DEGREE: usize>(
     input_plaintext_list: &[ResiduePoly<Z, EXTENSION_DEGREE>],
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
     encryption_type: EncryptionType,
-) -> anyhow::Result<()>
-where
-    Gen: ByteRandomGenerator,
+) where
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     let (mask, body) = output.get_mut_mask_and_body();
     *body = input_plaintext_list.to_vec();
@@ -116,36 +115,39 @@ where
         body,
         generator,
         encryption_type,
-    )?;
-    Ok(())
+    );
 }
 
-pub fn encrypt_glwe_ciphertext_list<Gen, Z, const EXTENSION_DEGREE: usize>(
+/// Warning: this function panics if number of chunks in `input_plaintext_list` does not match the length of the `output_glwe_ciphertext_list`.
+pub(crate) fn encrypt_glwe_ciphertext_list<Gen, Z, const EXTENSION_DEGREE: usize>(
     glwe_secret_key: &GlweSecretKeyShare<Z, EXTENSION_DEGREE>,
     output_glwe_ciphertext_list: &mut [GlweCiphertextShare<Z, EXTENSION_DEGREE>],
     input_plaintext_list: &[ResiduePoly<Z, EXTENSION_DEGREE>],
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
     encryption_type: EncryptionType,
-) -> anyhow::Result<()>
-where
-    Gen: ByteRandomGenerator,
+) where
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     let polynomial_size = glwe_secret_key.polynomial_size();
-    for (ciphertext, encoded) in output_glwe_ciphertext_list
-        .iter_mut()
-        .zip(input_plaintext_list.chunks_exact(polynomial_size.0))
-    {
+    let chunks = input_plaintext_list.chunks_exact(polynomial_size.0);
+    if output_glwe_ciphertext_list.len() != chunks.len() {
+        panic!(
+            "Number of ciphertexts {} does not match number of plaintexts {}",
+            output_glwe_ciphertext_list.len(),
+            chunks.len()
+        );
+    }
+    for (ciphertext, encoded) in output_glwe_ciphertext_list.iter_mut().zip_eq(chunks) {
         encrypt_glwe_ciphertext(
             glwe_secret_key,
             ciphertext,
             encoded,
             generator,
             encryption_type,
-        )?;
+        );
     }
-    Ok(())
 }
 
 fn fill_glwe_mask_and_body_for_encryption_assign<Z, Gen, const EXTENSION_DEGREE: usize>(
@@ -154,19 +156,18 @@ fn fill_glwe_mask_and_body_for_encryption_assign<Z, Gen, const EXTENSION_DEGREE:
     output_body: &mut [ResiduePoly<Z, EXTENSION_DEGREE>],
     generator: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
     encryption_type: EncryptionType,
-) -> anyhow::Result<()>
-where
-    Gen: ByteRandomGenerator,
+) where
+    Gen: ParallelByteRandomGenerator,
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
 {
     //Sample the mask
     generator.fill_slice_with_random_mask_custom_mod(output_mask, encryption_type);
     //Put the noise in the body
-    generator.unsigned_torus_slice_wrapping_add_random_noise_custom_mod_assign(output_body)?;
+    generator.unsigned_torus_slice_wrapping_add_random_noise_custom_mod_assign(output_body);
 
     //Do the inner product between mask and key and add it to the body
-    polynomial_wrapping_add_multisum_assign(output_body, output_mask, glwe_secret_key_share)
+    polynomial_wrapping_add_multisum_assign(output_body, output_mask, glwe_secret_key_share);
 }
 
 ///Returns a tuple (number_of_triples,number_of_random) required for mpc glwe encrpytion
@@ -205,19 +206,21 @@ mod tests {
             CiphertextModulus,
         },
     };
-    use tfhe_csprng::generators::SoftwareRandomGenerator;
+    use tfhe_csprng::{generators::SoftwareRandomGenerator, seeders::XofSeed};
 
     use crate::{
         algebra::{galois_rings::degree_4::ResiduePolyF4Z64, structure_traits::Ring},
         execution::{
             online::{
-                gen_bits::{BitGenEven, RealBitGenEven},
+                gen_bits::{BitGenEven, SecureBitGenEven},
                 preprocessing::dummy::DummyPreprocessing,
                 secret_distributions::{RealSecretDistributions, SecretDistributions},
             },
             runtime::{
                 party::Role,
-                session::{LargeSession, ParameterHandles},
+                sessions::{
+                    large_session::LargeSession, session_parameters::GenericParameterHandles,
+                },
             },
             sharing::{shamir::ShamirSharings, share::Share},
             tfhe_internals::{
@@ -238,9 +241,9 @@ mod tests {
     use crate::execution::sharing::shamir::InputOp;
 
     //Test that we can encrypt with our code and decrypt with TFHE-rs
-    #[test]
+    #[tokio::test]
     #[ignore] //Fails on CI due to timeout
-    fn test_glwe_encryption() {
+    async fn test_glwe_encryption() {
         //Testing with NIST params P=8
         let polynomial_size = 512_usize;
         let polynomial_size = PolynomialSize(polynomial_size);
@@ -255,7 +258,8 @@ mod tests {
         let num_key_bits = glwe_dimension * polynomial_size.0;
 
         let mut task = |mut session: LargeSession| async move {
-            let my_role = session.my_role().unwrap();
+            let xof_seed = XofSeed::new_u128(seed, *b"TEST_GEN");
+            let my_role = session.my_role();
             let encoded_message = (0..polynomial_size.0)
                 .map(|idx| {
                     ShamirSharings::share(
@@ -265,19 +269,23 @@ mod tests {
                         session.threshold() as usize,
                     )
                     .unwrap()
-                    .shares[my_role.zero_based()]
-                    .value()
+                    .shares[&my_role]
+                        .value()
                 })
                 .collect_vec();
 
             let t_uniform_amount = polynomial_size.0;
 
-            let mut large_preproc = DummyPreprocessing::new(seed as u64, session.clone());
+            let mut large_preproc = DummyPreprocessing::new(seed as u64, &session);
 
             let glwe_secret_key_share = GlweSecretKeyShare {
-                data: RealBitGenEven::gen_bits_even(num_key_bits, &mut large_preproc, &mut session)
-                    .await
-                    .unwrap(),
+                data: SecureBitGenEven::gen_bits_even(
+                    num_key_bits,
+                    &mut large_preproc,
+                    &mut session,
+                )
+                .await
+                .unwrap(),
                 polynomial_size,
             };
 
@@ -292,7 +300,7 @@ mod tests {
             .collect_vec();
 
             let mut mpc_encryption_rng = MPCEncryptionRandomGenerator {
-                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(seed),
+                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(xof_seed),
                 noise: MPCNoiseRandomGenerator {
                     vec: vec_tuniform_noise,
                 },
@@ -308,10 +316,9 @@ mod tests {
                 &glwe_secret_key_share,
                 &mut glwe_ctxt,
                 &mut mpc_encryption_rng,
-            )
-            .unwrap();
+            );
 
-            (session.my_role().unwrap(), glwe_secret_key_share, glwe_ctxt)
+            (session.my_role(), glwe_secret_key_share, glwe_ctxt)
         };
         let parties = 5;
         let threshold = 1;
@@ -331,7 +338,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         let mut glwe_ctxt_shares: HashMap<Role, Vec<Share<_>>> = HashMap::new();
         let mut glwe_key_shares: HashMap<Role, Vec<Share<_>>> = HashMap::new();
@@ -372,14 +380,14 @@ mod tests {
         let mut glwe_ctxt_mut_mask = glwe_ctxt.get_mut_mask();
         let underlying_container = glwe_ctxt_mut_mask.as_mut();
         assert_eq!(underlying_container.len(), mask_ref.len());
-        for (c, m) in underlying_container.iter_mut().zip(mask_ref) {
+        for (c, m) in underlying_container.iter_mut().zip_eq(mask_ref) {
             *c = m.0;
         }
 
         let mut glwe_ctxt_mut_body = glwe_ctxt.get_mut_body();
         let underlying_container = glwe_ctxt_mut_body.as_mut();
         assert_eq!(underlying_container.len(), body.len());
-        for (c, m) in underlying_container.iter_mut().zip(body) {
+        for (c, m) in underlying_container.iter_mut().zip_eq(body) {
             *c = m.0;
         }
 

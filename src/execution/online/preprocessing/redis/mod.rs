@@ -13,8 +13,8 @@ use redis::{Commands, RedisResult};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::slice::Iter;
 use std::sync::Arc;
+use strum::IntoEnumIterator;
 
 use super::RandomPreprocessing;
 use crate::execution::online::preprocessing::BitDecPreprocessing;
@@ -78,7 +78,7 @@ impl<const EXTENSION_DEGREE: usize> RedisPreprocessorFactory<EXTENSION_DEGREE> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, strum_macros::EnumIter)]
 pub enum CorrelatedRandomnessType {
     Triple,
     Randomness,
@@ -89,22 +89,7 @@ pub enum CorrelatedRandomnessType {
     NoiseGlwe,
     NoiseGlweSnS,
     NoiseCompressionKSK,
-}
-
-impl CorrelatedRandomnessType {
-    pub fn iterator() -> Iter<'static, CorrelatedRandomnessType> {
-        static CORRELATED_RANDOMNESS_TYPES: [CorrelatedRandomnessType; 7] = [
-            CorrelatedRandomnessType::Triple,
-            CorrelatedRandomnessType::Randomness,
-            CorrelatedRandomnessType::Bit,
-            CorrelatedRandomnessType::DDecMask,
-            CorrelatedRandomnessType::NoiseLwe,
-            CorrelatedRandomnessType::NoiseGlwe,
-            CorrelatedRandomnessType::NoiseGlweSnS,
-        ];
-
-        CORRELATED_RANDOMNESS_TYPES.iter()
-    }
+    SnsNoiseCompressionKSK,
 }
 
 impl CorrelatedRandomnessType {
@@ -119,6 +104,7 @@ impl CorrelatedRandomnessType {
             CorrelatedRandomnessType::NoiseGlwe => "_noise_glwe",
             CorrelatedRandomnessType::NoiseGlweSnS => "_noise_glwe_sns",
             CorrelatedRandomnessType::NoiseCompressionKSK => "_noise_compression_ksk",
+            CorrelatedRandomnessType::SnsNoiseCompressionKSK => "_sns_noise_compression_ksk",
         }
     }
 }
@@ -130,31 +116,34 @@ pub fn compute_key(key_prefix: String, correlated_randomness: CorrelatedRandomne
 fn store_correlated_randomness<S: Serialize>(
     client: Arc<Client>,
     data: &[S],
-    correlated_randomness: CorrelatedRandomnessType,
+    correlated_randomness_type: CorrelatedRandomnessType,
     key_prefix: String,
 ) -> RedisResult<()> {
     let mut con = client.get_connection()?;
 
     let serialized: Vec<Vec<u8>> =
         data.iter()
-            .map(bincode::serialize)
+            .map(bc2wrap::serialize)
             .try_collect()
             .map_err(|_| {
                 redis::RedisError::from((redis::ErrorKind::TypeError, "Could not serialize "))
             })?;
 
-    con.lpush(compute_key(key_prefix, correlated_randomness), serialized)
+    con.lpush(
+        compute_key(key_prefix, correlated_randomness_type),
+        serialized,
+    )
 }
 
 fn fetch_correlated_randomness<T: for<'de> Deserialize<'de>>(
     client: Arc<Client>,
     amount: usize,
-    correlated_randomness: CorrelatedRandomnessType,
+    correlated_randomness_type: CorrelatedRandomnessType,
     key_prefix: String,
 ) -> RedisResult<Vec<T>> {
     let mut con = client.get_connection()?;
     let serialized_correlated_randomness: Vec<Vec<u8>> = con.rpop(
-        compute_key(key_prefix, correlated_randomness),
+        compute_key(key_prefix, correlated_randomness_type),
         NonZeroUsize::new(amount),
     )?;
 
@@ -162,13 +151,32 @@ fn fetch_correlated_randomness<T: for<'de> Deserialize<'de>>(
     let correlated_randomness = serialized_correlated_randomness
         .iter()
         .map(|serialized| {
-            bincode::deserialize(serialized).map_err(|_| {
+            // We can not use the safe deserialization as the amount of data that is fetched
+            // can be over 2GB in total.
+            // However, we should control our own Redis instance, if it's compromised we are
+            // already in trouble anyway.
+            bc2wrap::deserialize_unsafe(serialized).map_err(|_| {
                 redis::RedisError::from((redis::ErrorKind::TypeError, "Could not deserialize"))
             })
         })
         .collect::<Result<Vec<T>, _>>()?;
 
-    Ok(correlated_randomness)
+    if correlated_randomness.len() != amount {
+        // Note: What was popped will be discarded.
+        // But something went quite wrong already anyway.
+        Err(redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "Pop length error.",
+            format!(
+                "Expected a vector of {:?} of length {}, but received one of length {}",
+                correlated_randomness_type,
+                amount,
+                correlated_randomness.len()
+            ),
+        )))
+    } else {
+        Ok(correlated_randomness)
+    }
 }
 
 fn correlated_randomness_len(
@@ -347,6 +355,53 @@ pub struct RedisPreprocessing<R: Ring> {
     _phantom: PhantomData<R>,
 }
 
+impl<R: Ring> Drop for RedisPreprocessing<R> {
+    // Custom drop implementation to make sure there's no dangling
+    // correlated randomness stored in Redis if there are no more references
+    // to it in rust.
+    // NOTE: Ideally we'd Zeroize it but afaict Redis doesn't propose such functionality
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let keys = CorrelatedRandomnessType::iter()
+            .map(|randoness_type| compute_key(self.key_prefix.clone(), randoness_type))
+            .collect::<Vec<_>>();
+
+        // Defer cleanup to a tokio blocking thread
+        // to avoid blocking the potential current tokio async worker
+        // Note: This thus assumes we are inside a tokio runtime
+        tokio::task::spawn_blocking(move || {
+            // Cleanup logic here
+            let mut con = match client.get_connection() {
+                Ok(con) => {
+                    tracing::info!("Connection to redis for cleanup");
+                    con
+                }
+                Err(_) => {
+                    tracing::warn!("Failed to connect to redis to cleanup");
+                    return;
+                }
+            };
+
+            for key in keys {
+                // Log the size to know whether we actually deleted something
+                match con.llen::<&str, usize>(&key) {
+                    Ok(len) => {
+                        tracing::info!("About to delete {len} elements for key {key}")
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to get length of key {key} from Redis: {}", e);
+                    }
+                }
+
+                // In any case remove the key from Redis
+                let _: RedisResult<()> = con.del(&key).inspect_err(|e| {
+                    tracing::warn!("Failed to delete key {key} from Redis: {}", e);
+                });
+            }
+        });
+    }
+}
+
 impl<R: Ring> RedisPreprocessing<R> {
     fn new(key_prefix: String, client: Arc<Client>) -> Self {
         Self {
@@ -485,9 +540,9 @@ impl<R: Ring> TriplePreprocessing<R> for RedisPreprocessing<R> {
     }
 }
 
-mod bitdec;
-mod dkg;
-mod noiseflood;
+pub(crate) mod bitdec;
+pub(crate) mod dkg;
+pub(crate) mod noiseflood;
 
 #[cfg(test)]
 pub mod tests {
@@ -508,35 +563,35 @@ pub mod tests {
                 #[test]
                 fn [<test_share_serialization_deserialization $z:lower>]() {
                     let share = Share::new(
-                        Role::indexed_by_one(1),
+                        Role::indexed_from_one(1),
                         ResiduePolyF4::<$z>::from_scalar(Wrapping(42)),
                     );
 
-                    let serialized = bincode::serialize(&share).unwrap();
-                    let deserialized = bincode::deserialize(&serialized).unwrap();
+                    let serialized = bc2wrap::serialize(&share).unwrap();
+                    let deserialized = bc2wrap::deserialize_unsafe(&serialized).unwrap();
                     assert_eq!(share, deserialized);
                 }
 
                 #[test]
                 fn [<test_triple_serialization_deserialization $z:lower>]() {
                     let share_one = Share::new(
-                        Role::indexed_by_one(1),
+                        Role::indexed_from_one(1),
                         ResiduePolyF4::<$z>::from_scalar(Wrapping(42)),
                     );
 
                     let share_two = Share::new(
-                        Role::indexed_by_one(2),
+                        Role::indexed_from_one(2),
                         ResiduePolyF4::<$z>::from_scalar(Wrapping(43)),
                     );
 
                     let share_three = Share::new(
-                        Role::indexed_by_one(3),
+                        Role::indexed_from_one(3),
                         ResiduePolyF4::<$z>::from_scalar(Wrapping(42)),
                     );
 
                     let triple = Triple::<ResiduePolyF4<$z>>::new(share_one, share_two, share_three);
-                    let serialized = bincode::serialize(&triple).unwrap();
-                    let deserialized: Triple<ResiduePolyF4<$z>> = bincode::deserialize(&serialized).unwrap();
+                    let serialized = bc2wrap::serialize(&triple).unwrap();
+                    let deserialized: Triple<ResiduePolyF4<$z>> = bc2wrap::deserialize_unsafe(&serialized).unwrap();
 
                     assert_eq!(triple, deserialized);
                 }
@@ -549,10 +604,10 @@ pub mod tests {
 
     #[test]
     fn test_share_serialization_deserialization_gf256() {
-        let share = Share::new(Role::indexed_by_one(1), GF16::from(12));
+        let share = Share::new(Role::indexed_from_one(1), GF16::from(12));
 
-        let serialized = bincode::serialize(&share).unwrap();
-        let deserialized: Share<GF16> = bincode::deserialize(&serialized).unwrap();
+        let serialized = bc2wrap::serialize(&share).unwrap();
+        let deserialized: Share<GF16> = bc2wrap::deserialize_unsafe(&serialized).unwrap();
         assert_eq!(share, deserialized);
     }
 

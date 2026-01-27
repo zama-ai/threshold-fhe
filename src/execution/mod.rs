@@ -4,13 +4,7 @@ pub mod communication {
     pub mod p2p;
 }
 pub mod constants;
-pub mod runtime {
-    pub mod party;
-    #[cfg(feature = "non-wasm")]
-    pub mod session;
-    #[cfg(any(test, feature = "testing"))]
-    pub mod test_runtime;
-}
+pub mod runtime;
 
 #[cfg(feature = "non-wasm")]
 pub mod small_execution {
@@ -22,6 +16,8 @@ pub mod small_execution {
 pub mod random;
 pub mod endpoints {
     pub mod decryption;
+    #[cfg(feature = "non-wasm")]
+    pub mod reshare_sk;
     // We keep decryption_non_wasm a private module and reexport it in decryption.
     #[cfg(feature = "non-wasm")]
     mod decryption_non_wasm;
@@ -67,6 +63,8 @@ pub mod tfhe_internals {
     #[cfg(feature = "non-wasm")]
     pub mod compression_decompression_key;
     #[cfg(feature = "non-wasm")]
+    pub mod compression_decompression_key_generation;
+    #[cfg(feature = "non-wasm")]
     pub mod ggsw_ciphertext;
     #[cfg(feature = "non-wasm")]
     pub mod glwe_ciphertext;
@@ -88,10 +86,20 @@ pub mod tfhe_internals {
     pub mod lwe_packing_keyswitch_key;
     #[cfg(feature = "non-wasm")]
     pub mod lwe_packing_keyswitch_key_generation;
+    #[cfg(feature = "non-wasm")]
+    pub mod modulus_switch_noise_reduction_key_generation;
     pub mod parameters;
+    #[cfg(feature = "non-wasm")]
+    pub mod private_keysets;
+    #[cfg(feature = "non-wasm")]
+    pub mod public_keysets;
     #[cfg(feature = "non-wasm")]
     pub mod randomness;
     mod raw_parameters;
+    #[cfg(feature = "non-wasm")]
+    pub mod sns_compression_key;
+    #[cfg(feature = "non-wasm")]
+    pub mod sns_compression_key_generation;
     pub mod switch_and_squash;
     #[cfg(any(test, feature = "testing"))]
     pub mod test_feature;

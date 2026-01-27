@@ -5,9 +5,16 @@ use super::Party;
 use crate::{
     execution::online::preprocessing::redis::RedisConf, networking::grpc::CoreToCoreNetworkConfig,
 };
-use conf_trace::conf::TelemetryConfig;
 use itertools::Itertools;
+use observability::conf::TelemetryConfig;
 use serde::{Deserialize, Serialize};
+use tokio_rustls::rustls::{
+    client::ClientConfig,
+    pki_types::{CertificateDer, PrivateKeyDer},
+    version::TLS13,
+    RootCertStore,
+};
+use x509_parser::pem::parse_x509_pem;
 
 /// Struct for storing protocol settings
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -68,6 +75,48 @@ impl CertificatePaths {
         let cert = std::fs::read_to_string(&self.cert)?;
         let key = std::fs::read_to_string(&self.key)?;
         Ok(tonic::transport::Identity::from_pem(cert, key))
+    }
+
+    pub fn get_client_tls_conf(&self) -> anyhow::Result<ClientConfig> {
+        // public key certificate
+        let cert_bytes = std::fs::read_to_string(&self.cert)?;
+        let cert = parse_x509_pem(cert_bytes.as_ref())?.1;
+        let cert_chain = vec![CertificateDer::from_slice(cert.contents.as_slice()).into_owned()];
+
+        // private key
+        let key_bytes = std::fs::read_to_string(&self.key)?;
+        let key = parse_x509_pem(key_bytes.as_ref())?.1;
+        let key_der = PrivateKeyDer::try_from(key.contents.as_slice())
+            .unwrap_or_else(|e| panic!("Could not read TLS private key: {e}"))
+            .clone_key();
+
+        // trust roots
+        let ca_certs_bytes = self
+            .calist
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Could not read CA certificates: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ca_certs_list = ca_certs_bytes
+            .into_iter()
+            .map(|cert_bytes| {
+                parse_x509_pem(cert_bytes.as_ref())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse CA certificate: {e}"))
+                    .map(|(_, cert)| cert)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut roots = RootCertStore::empty();
+        for cert in ca_certs_list {
+            roots.add(CertificateDer::from_slice(&cert.contents))?;
+        }
+
+        ClientConfig::builder_with_protocol_versions(&[&TLS13])
+            .with_root_certificates(roots)
+            .with_client_auth_cert(cert_chain, key_der)
+            .map_err(|e| anyhow::anyhow!("Failed to build TLS client configuration: {e}"))
     }
 
     pub fn get_flattened_ca_list(&self) -> anyhow::Result<tonic::transport::Certificate> {
@@ -191,7 +240,7 @@ impl PartyConf {
 
 #[cfg(test)]
 mod tests {
-    use conf_trace::conf::Settings;
+    use observability::conf::Settings;
     use std::env;
 
     use super::*;

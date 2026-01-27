@@ -6,14 +6,14 @@ use crate::{
     execution::{
         keyset_config::KeySetConfig,
         online::{
-            gen_bits::{BitGenEven, RealBitGenEven},
+            gen_bits::{BitGenEven, SecureBitGenEven},
             preprocessing::{
                 BasePreprocessing, BitPreprocessing, DKGPreprocessing, NoiseBounds,
                 RandomPreprocessing, TriplePreprocessing,
             },
             triple::Triple,
         },
-        runtime::session::BaseSession,
+        runtime::sessions::base_session::BaseSession,
         sharing::share::Share,
         small_execution::prf::PRSSConversions,
         tfhe_internals::parameters::DKGParams,
@@ -31,6 +31,7 @@ pub struct InMemoryDKGPreprocessing<Z: Ring> {
     available_noise_glwe: Vec<Share<Z>>,
     available_noise_oglwe: Vec<Share<Z>>,
     available_noise_compression_key: Vec<Share<Z>>,
+    available_noise_sns_compression_key: Vec<Share<Z>>,
 }
 
 impl<Z: Ring> TriplePreprocessing<Z> for InMemoryDKGPreprocessing<Z> {
@@ -97,6 +98,9 @@ where
             NoiseBounds::CompressionKSKNoise(_) => {
                 self.available_noise_compression_key.extend(noises)
             }
+            NoiseBounds::SnsCompressionKSKNoise(_) => {
+                self.available_noise_sns_compression_key.extend(noises)
+            }
         }
     }
 
@@ -113,6 +117,7 @@ where
             NoiseBounds::GlweNoise(_) => &mut self.available_noise_glwe,
             NoiseBounds::GlweNoiseSnS(_) => &mut self.available_noise_oglwe,
             NoiseBounds::CompressionKSKNoise(_) => &mut self.available_noise_compression_key,
+            NoiseBounds::SnsCompressionKSKNoise(_) => &mut self.available_noise_sns_compression_key,
         };
 
         if noise_distrib.len() >= amount {
@@ -144,7 +149,7 @@ where
         let mut bit_preproc = InMemoryBitPreprocessing::default();
 
         bit_preproc.append_bits(
-            RealBitGenEven::gen_bits_even(num_bits_required, preprocessing, session).await?,
+            SecureBitGenEven::gen_bits_even(num_bits_required, preprocessing, session).await?,
         );
 
         self.fill_from_triples_and_bit_preproc(
@@ -184,6 +189,9 @@ where
             NoiseBounds::GlweNoise(_) => self.available_noise_glwe.len(),
             NoiseBounds::GlweNoiseSnS(_) => self.available_noise_oglwe.len(),
             NoiseBounds::CompressionKSKNoise(_) => self.available_noise_compression_key.len(),
+            NoiseBounds::SnsCompressionKSKNoise(_) => {
+                self.available_noise_sns_compression_key.len()
+            }
         }
     }
 }

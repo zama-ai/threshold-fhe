@@ -1,9 +1,12 @@
 use crate::{
     algebra::{
         galois_rings::common::ResiduePoly,
-        structure_traits::{BaseRing, Ring, Zero},
+        structure_traits::{BaseRing, ErrorCorrect, Zero},
     },
-    error::error_handler::anyhow_error_and_log,
+    execution::{
+        online::preprocessing::DKGPreprocessing,
+        runtime::sessions::base_session::BaseSessionHandles, tfhe_internals::parameters::KSKParams,
+    },
 };
 
 use super::{
@@ -12,12 +15,21 @@ use super::{
     lwe_keyswitch_key::LweKeySwitchKeyShare,
     randomness::MPCEncryptionRandomGenerator,
 };
-use itertools::{EitherOrBoth, Itertools};
+use itertools::Itertools;
 use tfhe::{
-    core_crypto::{commons::math::decomposition::DecompositionLevel, prelude::ByteRandomGenerator},
+    core_crypto::{
+        commons::math::decomposition::DecompositionLevel,
+        prelude::{LweKeyswitchKey, ParallelByteRandomGenerator, SeededLweKeyswitchKey},
+    },
     shortint::parameters::{DecompositionBaseLog, DecompositionLevelCount, LweDimension},
 };
+use tracing::instrument;
 
+// If for some reason we fail in forking the mask generator, during encryption
+// we will return an error, after having changed some of the state of the lwe_keyswitch_key
+// but it seems hard to prevent it
+#[allow(unknown_lints)]
+#[allow(non_local_effect_before_error_return)]
 pub fn generate_lwe_keyswitch_key<Z, Gen, const EXTENSION_DEGREE: usize>(
     input_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
     output_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
@@ -26,46 +38,47 @@ pub fn generate_lwe_keyswitch_key<Z, Gen, const EXTENSION_DEGREE: usize>(
 ) -> anyhow::Result<()>
 where
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
-    Gen: ByteRandomGenerator,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+    Gen: ParallelByteRandomGenerator,
 {
     let decomp_base_log = lwe_keyswitch_key.decomposition_base_log();
     let decomp_level_count = lwe_keyswitch_key.decomposition_level_count();
 
+    let input_key_it = input_lwe_sk.data_as_raw_vec().into_iter();
+    let key_switch_key_block_it = lwe_keyswitch_key.iter_mut_levels();
+
+    assert_eq!(
+        input_key_it.len(),
+        key_switch_key_block_it.len(),
+        "Input LWE secret key and LWE keyswitch key have different dimensions: {} != {}",
+        input_key_it.len(),
+        key_switch_key_block_it.len(),
+    );
+
     let mut decomposition_plaintexts_buffer =
         vec![ResiduePoly::<Z, EXTENSION_DEGREE>::ZERO; decomp_level_count.0];
 
-    for input_key_element_key_switch_key_block in input_lwe_sk
-        .data_as_raw_vec()
-        .iter()
-        .zip_longest(lwe_keyswitch_key.iter_mut_levels())
-    {
-        if let EitherOrBoth::Both(input_key_element, key_switch_key_block) =
-            input_key_element_key_switch_key_block
+    // zip_eq can panic but we just checked the length above
+    for (input_key_element, key_switch_key_block) in input_key_it.zip_eq(key_switch_key_block_it) {
+        // zip_eq can panic, but we just defined decomposition_plaintexts_buffer with the right size
+        for (level, message) in (1..=decomp_level_count.0)
+            .rev()
+            .map(DecompositionLevel)
+            .zip_eq(decomposition_plaintexts_buffer.iter_mut())
         {
-            for level_message in (1..=decomp_level_count.0)
-                .rev()
-                .map(DecompositionLevel)
-                .zip_longest(decomposition_plaintexts_buffer.iter_mut())
-            {
-                if let EitherOrBoth::Both(level, message) = level_message {
-                    //We only generate KSK in the smaller encryption domain, so we hardcode the 64 value here
-                    let shift = 64 - decomp_base_log.0 * level.0;
-                    *message = (*input_key_element) << shift;
-                } else {
-                    return Err(anyhow_error_and_log("zip error"));
-                }
-            }
-
-            encrypt_lwe_ciphertext_list(
-                output_lwe_sk,
-                key_switch_key_block,
-                &decomposition_plaintexts_buffer,
-                generator,
-            )?;
-        } else {
-            return Err(anyhow_error_and_log("zip error"));
+            //We only generate KSK in the smaller encryption domain, so we hardcode the 64 value here
+            let shift = 64 - decomp_base_log.0 * level.0;
+            *message = input_key_element << shift;
         }
+
+        // NOTE: This causes potential non local effect before error return
+        // but it seems hard to prevent it
+        encrypt_lwe_ciphertext_list(
+            output_lwe_sk,
+            key_switch_key_block,
+            &decomposition_plaintexts_buffer,
+            generator,
+        )?;
     }
     Ok(())
 }
@@ -79,8 +92,8 @@ pub fn allocate_and_generate_new_lwe_keyswitch_key<Z, Gen, const EXTENSION_DEGRE
 ) -> anyhow::Result<LweKeySwitchKeyShare<Z, EXTENSION_DEGREE>>
 where
     Z: BaseRing,
-    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
-    Gen: ByteRandomGenerator,
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+    Gen: ParallelByteRandomGenerator,
 {
     let mut new_lwe_keyswitch_key = LweKeySwitchKeyShare::new(
         decomp_base_log,
@@ -108,6 +121,111 @@ pub fn get_batch_param_lwe_keyswitch_key(
         output_lwe_dimension.0 * decomp_level_count.0,
         t_uniform_bound,
     )
+}
+
+/// Generate KSK shares using MPC encryption
+fn generate_ksk_share<
+    Z: BaseRing,
+    P: DKGPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+    S: BaseSessionHandles,
+    Gen: ParallelByteRandomGenerator,
+    const EXTENSION_DEGREE: usize,
+>(
+    input_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    output_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    params: &KSKParams,
+    mpc_encryption_rng: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
+    session: &mut S,
+    preprocessing: &mut P,
+) -> anyhow::Result<LweKeySwitchKeyShare<Z, EXTENSION_DEGREE>>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    let my_role = session.my_role();
+    tracing::info!("(Party {my_role}) Generating KSK...Start");
+    let vec_tuniform_noise = preprocessing
+        .next_noise_vec(params.num_needed_noise, params.noise_bound)?
+        .iter()
+        .map(|share| share.value())
+        .collect_vec();
+
+    mpc_encryption_rng.fill_noise(vec_tuniform_noise);
+
+    //Then compute the KSK
+    allocate_and_generate_new_lwe_keyswitch_key(
+        input_lwe_sk,
+        output_lwe_sk,
+        params.decomposition_base_log,
+        params.decomposition_level_count,
+        mpc_encryption_rng,
+    )
+}
+
+/// Generate the Key Switch Key from a Glwe key given in Lwe format,
+/// and an actual Lwe key
+#[instrument(name="Gen KSK",skip(input_lwe_sk, output_lwe_sk, mpc_encryption_rng, session, preprocessing), fields(sid = ?session.session_id(), my_role = ?session.my_role()))]
+pub(crate) async fn generate_key_switch_key<
+    Z: BaseRing,
+    P: DKGPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+    S: BaseSessionHandles,
+    Gen: ParallelByteRandomGenerator,
+    const EXTENSION_DEGREE: usize,
+>(
+    input_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    output_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    params: &KSKParams,
+    mpc_encryption_rng: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
+    session: &mut S,
+    preprocessing: &mut P,
+) -> anyhow::Result<LweKeyswitchKey<Vec<u64>>>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    let ksk_share = generate_ksk_share(
+        input_lwe_sk,
+        output_lwe_sk,
+        params,
+        mpc_encryption_rng,
+        session,
+        preprocessing,
+    )?;
+
+    //Open the KSK and cast it to TFHE-RS type
+    ksk_share.open_to_tfhers_type(session).await
+}
+
+/// Generate the Key Switch Key from a Glwe key given in Lwe format,
+/// and an actual Lwe key
+#[instrument(name="Gen compressed KSK",skip(input_lwe_sk, output_lwe_sk, mpc_encryption_rng, session, preprocessing, seed), fields(sid = ?session.session_id(), my_role = ?session.my_role()))]
+pub(crate) async fn generate_compressed_key_switch_key<
+    Z: BaseRing,
+    P: DKGPreprocessing<ResiduePoly<Z, EXTENSION_DEGREE>> + ?Sized,
+    S: BaseSessionHandles,
+    Gen: ParallelByteRandomGenerator,
+    const EXTENSION_DEGREE: usize,
+>(
+    input_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    output_lwe_sk: &LweSecretKeyShare<Z, EXTENSION_DEGREE>,
+    params: &KSKParams,
+    mpc_encryption_rng: &mut MPCEncryptionRandomGenerator<Z, Gen, EXTENSION_DEGREE>,
+    session: &mut S,
+    preprocessing: &mut P,
+    seed: u128,
+) -> anyhow::Result<SeededLweKeyswitchKey<Vec<u64>>>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ErrorCorrect,
+{
+    let ksk_share = generate_ksk_share(
+        input_lwe_sk,
+        output_lwe_sk,
+        params,
+        mpc_encryption_rng,
+        session,
+        preprocessing,
+    )?;
+
+    //Open the KSK and cast it to TFHE-RS seeded type
+    ksk_share.open_to_tfhers_seeded_type(seed, session).await
 }
 
 #[cfg(test)]
@@ -144,11 +262,13 @@ mod tests {
         },
         execution::{
             online::{
-                gen_bits::{BitGenEven, RealBitGenEven},
+                gen_bits::{BitGenEven, SecureBitGenEven},
                 preprocessing::dummy::DummyPreprocessing,
                 secret_distributions::{RealSecretDistributions, SecretDistributions},
             },
-            runtime::session::{LargeSession, ParameterHandles},
+            runtime::sessions::{
+                large_session::LargeSession, session_parameters::GenericParameterHandles,
+            },
             tfhe_internals::{
                 glwe_key::GlweSecretKeyShare,
                 lwe_key::LweSecretKeyShare,
@@ -162,13 +282,13 @@ mod tests {
         networking::NetworkMode,
         tests::helper::tests_and_benches::execute_protocol_large,
     };
-    use tfhe_csprng::generators::SoftwareRandomGenerator;
+    use tfhe_csprng::{generators::SoftwareRandomGenerator, seeders::XofSeed};
 
     use super::allocate_and_generate_new_lwe_keyswitch_key;
 
-    #[test]
+    #[tokio::test]
     #[ignore] //Ignore for now, might be able to run on CI with bigger timeout though
-    fn test_lwe_keyswitch() {
+    async fn test_lwe_keyswitch() {
         //Testing with NIST params P=8
         let lwe_dimension = 1024_usize;
         let polynomial_size = 512_usize;
@@ -187,11 +307,12 @@ mod tests {
         let num_key_bits_glwe = glwe_dimension * polynomial_size;
 
         let mut task = |mut session: LargeSession| async move {
-            let mut large_preproc = DummyPreprocessing::new(seed as u64, session.clone());
+            let xof_seed = XofSeed::new_u128(seed, *b"TEST_GEN");
+            let mut large_preproc = DummyPreprocessing::new(seed as u64, &session);
 
             //Generate the Lwe key
             let lwe_secret_key_share = LweSecretKeyShare::<Z64, 4> {
-                data: RealBitGenEven::gen_bits_even(
+                data: SecureBitGenEven::gen_bits_even(
                     num_key_bits_lwe,
                     &mut large_preproc,
                     &mut session,
@@ -202,7 +323,7 @@ mod tests {
 
             //Generate the Glwe key
             let glwe_secret_key_share = GlweSecretKeyShare::<Z64, 4> {
-                data: RealBitGenEven::gen_bits_even(
+                data: SecureBitGenEven::gen_bits_even(
                     num_key_bits_glwe,
                     &mut large_preproc,
                     &mut session,
@@ -225,7 +346,7 @@ mod tests {
             .collect_vec();
 
             let mut mpc_encryption_rng = MPCEncryptionRandomGenerator {
-                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(seed),
+                mask: MPCMaskRandomGenerator::<SoftwareRandomGenerator>::new_from_seed(xof_seed),
                 noise: MPCNoiseRandomGenerator {
                     vec: vec_tuniform_noise,
                 },
@@ -248,7 +369,7 @@ mod tests {
                 .await
                 .unwrap();
             (
-                session.my_role().unwrap(),
+                session.my_role(),
                 lwe_secret_key_share,
                 glwe_secret_key_share,
                 ksk_opened,
@@ -273,7 +394,8 @@ mod tests {
             NetworkMode::Async,
             Some(delay_vec),
             &mut task,
-        );
+        )
+        .await;
 
         let mut lwe_key_shares = HashMap::new();
         let mut glwe_key_shares = HashMap::new();

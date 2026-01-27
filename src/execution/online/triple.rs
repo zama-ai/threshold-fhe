@@ -1,14 +1,18 @@
+use std::sync::Arc;
+
 use crate::{
     algebra::structure_traits::{ErrorCorrect, Ring},
-    error::error_handler::{anyhow_error_and_log, log_error_wrapper},
+    error::error_handler::anyhow_error_and_log,
     execution::{
-        runtime::session::BaseSessionHandles,
-        sharing::{open::robust_opens_to_all, share::Share},
+        runtime::sessions::base_session::BaseSessionHandles,
+        sharing::{
+            open::{RobustOpen, SecureRobustOpen},
+            share::Share,
+        },
     },
+    thread_handles::spawn_compute_bound,
 };
-use anyhow::Context;
 use itertools::Itertools;
-use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -35,13 +39,13 @@ impl<R: Ring + Sync> Triple<R> {
 ///     [rho]       =[y]+[triple.b]
 ///     Open        [epsilon], [rho]
 ///     Output [z]  =[y]*epsilon-[triple.a]*rho+[triple.c]
-pub async fn mult<Z: Ring + ErrorCorrect, Rnd: Rng + CryptoRng, Ses: BaseSessionHandles<Rnd>>(
+pub async fn mult<Z: Ring + ErrorCorrect, Ses: BaseSessionHandles>(
     x: Share<Z>,
     y: Share<Z>,
     triple: Triple<Z>,
     session: &Ses,
 ) -> anyhow::Result<Share<Z>> {
-    let res = mult_list(&[x], &[y], vec![triple], session).await?;
+    let res = mult_list(Arc::new(vec![x]), Arc::new(vec![y]), vec![triple], session).await?;
     match res.first() {
         Some(res) => Ok(*res),
         None => Err(anyhow_error_and_log(
@@ -56,14 +60,10 @@ pub async fn mult<Z: Ring + ErrorCorrect, Rnd: Rng + CryptoRng, Ses: BaseSession
 ///     [rho]       =[y]+[triple.b]
 ///     Open        [epsilon], [rho]
 ///     Output [z]  =[y]*epsilon-[triple.a]*rho+[triple.c]
-#[instrument(name="MPC.Mult", skip(session,x_vec,y_vec,triples), fields(sid = ?session.session_id(),own_identity=?session.own_identity(),batch_size=?x_vec.len()))]
-pub async fn mult_list<
-    Z: Ring + ErrorCorrect,
-    Rnd: Rng + CryptoRng,
-    Ses: BaseSessionHandles<Rnd>,
->(
-    x_vec: &[Share<Z>],
-    y_vec: &[Share<Z>],
+#[instrument(name="MPC.Mult", skip(session,x_vec,y_vec,triples), fields(sid = ?session.session_id(),my_role=?session.my_role(),batch_size=?x_vec.len()))]
+pub async fn mult_list<Z: Ring + ErrorCorrect, Ses: BaseSessionHandles>(
+    x_vec: Arc<Vec<Share<Z>>>,
+    y_vec: Arc<Vec<Share<Z>>>,
     triples: Vec<Triple<Z>>,
     session: &Ses,
 ) -> anyhow::Result<Vec<Share<Z>>> {
@@ -76,61 +76,63 @@ pub async fn mult_list<
             triples.len()
         )));
     }
-    let mut to_open = Vec::with_capacity(2 * amount);
-    // Compute the shares of epsilon and rho and merge them together into a single list
-    for ((cur_x, cur_y), cur_trip) in x_vec.iter().zip(y_vec).zip(&triples) {
-        if cur_x.owner() != cur_y.owner()
-            || cur_trip.a.owner() != cur_x.owner()
-            || cur_trip.b.owner() != cur_x.owner()
-            || cur_trip.c.owner() != cur_x.owner()
-        {
-            tracing::warn!("Trying to multiply with shares of different owners. This will always result in an incorrect share");
-        }
-        let share_epsilon = cur_trip.a + *cur_x;
-        let share_rho = cur_trip.b + *cur_y;
-        to_open.push(share_epsilon);
-        to_open.push(share_rho);
-    }
-    //NOTE: That's a lot of memory manipulation, could execute the "linear equation loop" with epsilonrho directly
+    let x_vec_cloned = x_vec.clone();
+    let y_vec_cloned = y_vec.clone();
+    let (triples_a, (triples_b, triples_c)): (Vec<_>, (Vec<_>, Vec<_>)) = triples
+        .into_iter()
+        .map(|triple| (triple.a, (triple.b, triple.c)))
+        .unzip();
+
+    let (y_vec, triples_a,to_open) = spawn_compute_bound(move || {
+        let res = x_vec_cloned.iter().zip_eq(
+            y_vec_cloned
+                .iter()
+                .zip(triples_a.iter().zip_eq(triples_b.into_iter())),
+        ).fold(Vec::with_capacity(2*amount), |mut acc, (cur_x, (cur_y, (cur_a, cur_b)))| {
+            if cur_x.owner() != cur_y.owner()
+                || cur_a.owner() != cur_x.owner()
+                || cur_b.owner() != cur_x.owner()
+            {
+                tracing::warn!("Trying to multiply with shares of different owners. This will always result in an incorrect share");
+            }
+            let share_epsilon =  cur_x + cur_a;
+            let share_rho = cur_b + cur_y;
+            acc.push(share_epsilon);
+            acc.push(share_rho);
+            acc
+    });
+    (y_vec_cloned,triples_a,res)
+    }).await?;
+
+    //NOTE: We execute the "linear equation loop" with epsilonrho directly
     // Open and seperate the list of both epsilon and rho values into two lists of values
-    let mut epsilonrho = open_list(&to_open, session).await?;
-    let mut epsilon_vec = Vec::with_capacity(amount);
-    let mut rho_vec = Vec::with_capacity(amount);
-    // Indicator variable if the current element is an epsilson value (or rho value)
-    let mut epsilon_val = false;
-    // Go through the list from the back
-    while let Some(cur_val) = epsilonrho.pop() {
-        match epsilon_val {
-            true => epsilon_vec.push(cur_val),
-            false => rho_vec.push(cur_val),
-        }
-        // Flip the indicator
-        epsilon_val = !epsilon_val;
+    let epsilonrho = open_list(&to_open, session).await?;
+
+    if 2 * amount != epsilonrho.len() {
+        return Err(anyhow_error_and_log(format!(
+            "Inconsistent share lengths: epsilonrho: {:?}. Expected {:?}",
+            epsilonrho.len(),
+            2 * amount
+        )));
     }
     // Compute the linear equation of shares to get the result
-    let mut res = Vec::with_capacity(amount);
-    for i in 0..amount {
-        let y = *y_vec
-            .get(i)
-            .with_context(|| log_error_wrapper("Missing y value"))?;
-        // Observe that the list of epsilons and rhos have already been reversed above, because of the use of pop,
-        // so we get the elements in the original order by popping again here
-        let epsilon = epsilon_vec
-            .pop()
-            .with_context(|| log_error_wrapper("Missing epsilon value"))?;
-        let rho = rho_vec
-            .pop()
-            .with_context(|| log_error_wrapper("Missing rho value"))?;
-        let trip = triples
-            .get(i)
-            .with_context(|| log_error_wrapper("Missing triple"))?;
-        res.push(y * epsilon - trip.a * rho + trip.c);
-    }
-    Ok(res)
+    spawn_compute_bound(move || {
+        let epsilon_rho_vec = epsilonrho.chunks(2);
+        y_vec
+            .iter()
+            .zip_eq(epsilon_rho_vec.zip_eq(triples_a.into_iter().zip_eq(triples_c.into_iter())))
+            .map(|(curr_y, (curr_epsilonrho, (curr_a, curr_c)))| {
+                //curr_epsilonrho is a pair of shares, so we need to extract them
+                //first is epsilon then rho
+                curr_y * curr_epsilonrho[0] - curr_a * curr_epsilonrho[1] + curr_c
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Opens a single secret
-pub async fn open<Z: Ring + ErrorCorrect, Rnd: Rng + CryptoRng, Ses: BaseSessionHandles<Rnd>>(
+pub async fn open<Z: Ring + ErrorCorrect, Ses: BaseSessionHandles>(
     to_open: Share<Z>,
     session: &Ses,
 ) -> anyhow::Result<Z> {
@@ -144,12 +146,8 @@ pub async fn open<Z: Ring + ErrorCorrect, Rnd: Rng + CryptoRng, Ses: BaseSession
 }
 
 /// Opens a list of secrets to all parties
-#[instrument(name="MPC.Open",skip(to_open, session),fields(sid=?session.session_id(),own_identity=?session.own_identity(),batch_size=?to_open.len()))]
-pub async fn open_list<
-    Z: Ring + ErrorCorrect,
-    Rnd: Rng + CryptoRng,
-    Ses: BaseSessionHandles<Rnd>,
->(
+#[instrument(name="MPC.Open",skip(to_open, session),fields(sid=?session.session_id(),my_role=?session.my_role(),batch_size=?to_open.len()))]
+pub async fn open_list<Z: Ring + ErrorCorrect, Ses: BaseSessionHandles>(
     to_open: &[Share<Z>],
     session: &Ses,
 ) -> anyhow::Result<Vec<Z>> {
@@ -157,11 +155,13 @@ pub async fn open_list<
         .iter()
         .map(|cur_open| cur_open.value())
         .collect_vec();
-    let opened_vals: Vec<Z> =
-        match robust_opens_to_all(session, &parsed_to_open, session.threshold() as usize).await? {
-            Some(opened_vals) => opened_vals,
-            None => return Err(anyhow_error_and_log("Could not open shares".to_string())),
-        };
+    let opened_vals: Vec<Z> = match SecureRobustOpen::default()
+        .robust_open_list_to_all(session, parsed_to_open, session.threshold() as usize)
+        .await?
+    {
+        Some(opened_vals) => opened_vals,
+        None => return Err(anyhow_error_and_log("Could not open shares".to_string())),
+    };
     Ok(opened_vals)
 }
 
@@ -191,25 +191,27 @@ mod tests {
                 triple::{mult, mult_list, open_list},
             },
             runtime::party::Role,
-            runtime::session::{ParameterHandles, SmallSession},
+            runtime::sessions::{
+                session_parameters::GenericParameterHandles, small_session::SmallSession,
+            },
         },
         networking::NetworkMode,
         tests::helper::tests_and_benches::execute_protocol_small,
     };
-    use aes_prng::AesRng;
     use paste::paste;
     use std::num::Wrapping;
+    use std::sync::Arc;
 
     macro_rules! test_triples {
         ($z:ty, $u:ty) => {
             paste! {
                 // Multiply random values and open the random values and the result
-                #[test]
-                fn [<mult_sunshine_ $z:lower>]() {
+                #[tokio::test]
+                async fn [<mult_sunshine_ $z:lower>]() {
                     let parties = 4;
                     let threshold = 1;
                     async fn task(session: SmallSession<$z>, _bot: Option<String>) -> Vec<$z> {
-                        let mut preprocessing = DummyPreprocessing::<$z, AesRng, SmallSession<$z>>::new(42, session.clone());
+                        let mut preprocessing = DummyPreprocessing::<$z>::new(42, &session);
                         let cur_a = preprocessing.next_random().unwrap();
                         let cur_b = preprocessing.next_random().unwrap();
                         let trip = preprocessing.next_triple().unwrap();
@@ -221,7 +223,7 @@ mod tests {
                     // Online phase so Async
                     //Delay P1 by 1s every round
                     let delay_vec = vec![tokio::time::Duration::from_secs(1)];
-                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, Some(2), NetworkMode::Async, Some(delay_vec), &mut task, None);
+                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, Some(2), NetworkMode::Async, Some(delay_vec), &mut task, None).await;
                     assert_eq!(results.len(), parties);
 
                     for cur_res in results {
@@ -233,8 +235,8 @@ mod tests {
                 }
 
                 // Multiply lists of random values and use repeated openings to open the random values and the result
-                #[test]
-                fn [<mult_list_sunshine_ $z:lower>]() {
+                #[tokio::test]
+                async fn [<mult_list_sunshine_ $z:lower>]() {
                     let parties = 4;
                     let threshold = 1;
                     const AMOUNT: usize = 3;
@@ -246,7 +248,7 @@ mod tests {
                         Vec<$z>,
                         Vec<$z>,
                     ) {
-                        let mut preprocessing = DummyPreprocessing::<$z, AesRng, SmallSession<$z>>::new(42, session.clone());
+                        let mut preprocessing = DummyPreprocessing::<$z>::new(42, &session);
                         let mut a_vec = Vec::with_capacity(AMOUNT);
                         let mut b_vec = Vec::with_capacity(AMOUNT);
                         let mut trip_vec = Vec::with_capacity(AMOUNT);
@@ -255,9 +257,12 @@ mod tests {
                             b_vec.push(preprocessing.next_random().unwrap());
                             trip_vec.push(preprocessing.next_triple().unwrap());
                         }
-                        let c_vec = mult_list(&a_vec, &b_vec, trip_vec, &session).await.unwrap();
-                        let a_plain = open_list(&a_vec, &session).await.unwrap();
-                        let b_plain = open_list(&b_vec, &session).await.unwrap();
+                        let a_vec = Arc::new(a_vec);
+                        let b_vec = Arc::new(b_vec);
+                        let c_vec = mult_list(Arc::clone(&a_vec), Arc::clone(&b_vec), trip_vec, &session).await.unwrap();
+
+                        let a_plain = open_list(a_vec.as_ref(), &session).await.unwrap();
+                        let b_plain = open_list(b_vec.as_ref(), &session).await.unwrap();
                         let c_plain = open_list(&c_vec, &session).await.unwrap();
                         (a_plain, b_plain, c_plain)
                     }
@@ -266,7 +271,7 @@ mod tests {
                     // Online phase so Async
                     //Delay P1 by 1s every round
                     let delay_vec = vec![tokio::time::Duration::from_secs(1)];
-                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, Some(4), NetworkMode::Async,Some(delay_vec), &mut task, None);
+                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, Some(4), NetworkMode::Async,Some(delay_vec), &mut task, None).await;
                     assert_eq!(results.len(), parties);
                     for (a_vec, b_vec, c_vec) in &results {
                         for i in 0..AMOUNT {
@@ -279,31 +284,31 @@ mod tests {
                 }
 
                 // Multiply random values and open the random values and the result when a party drops out
-                #[test]
-                fn [<mult_party_drop_ $z:lower>]() {
+                #[tokio::test]
+                async fn [<mult_party_drop_ $z:lower>]() {
                     let parties = 4;
                     let threshold = 1;
-                    let bad_role: Role = Role::indexed_by_one(4);
+                    let bad_role: Role = Role::indexed_from_one(4);
                     let mut task = |session: SmallSession<$z>, _bot: Option<String>| async move {
-                        if session.my_role().unwrap() != bad_role {
-                            let mut preprocessing = DummyPreprocessing::<$z, AesRng, SmallSession<$z>>::new(42, session.clone());
+                        if session.my_role() != bad_role {
+                            let mut preprocessing = DummyPreprocessing::<$z>::new(42, &session);
                             let cur_a = preprocessing.next_random().unwrap();
                             let cur_b = preprocessing.next_random().unwrap();
                             let trip = preprocessing.next_triple().unwrap();
                             let cur_c = mult(cur_a, cur_b, trip, &session).await.unwrap();
                             (
-                                session.my_role().unwrap(),
+                                session.my_role(),
                                 open_list(&[cur_a, cur_b, cur_c], &session).await.unwrap(),
                             )
                         } else {
-                            (session.my_role().unwrap(), Vec::new())
+                            (session.my_role(), Vec::new())
                         }
                     };
 
                     // Online phase so Async
                     //Delay P1 by 1s every round
                     let delay_vec = vec![tokio::time::Duration::from_secs(1)];
-                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, None, NetworkMode::Async, Some(delay_vec), &mut task, None);
+                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, None, NetworkMode::Async, Some(delay_vec), &mut task, None).await;
                     assert_eq!(results.len(), parties);
 
                     for (cur_role, cur_res) in results {
@@ -319,15 +324,15 @@ mod tests {
                 }
 
                 // Multiply random values and open the random values and the result when a party uses a wrong value
-                #[test]
-                fn [<mult_wrong_value_ $z:lower>]() {
+                #[tokio::test]
+                async fn [<mult_wrong_value_ $z:lower>]() {
                     let parties = 4;
                     let threshold = 1;
-                    let bad_role: Role = Role::indexed_by_one(4);
+                    let bad_role: Role = Role::indexed_from_one(4);
                     let mut task = |session: SmallSession<$z>, _bot: Option<String>| async move {
-                        let mut preprocessing = DummyPreprocessing::<$z, AesRng, SmallSession<$z>>::new(42, session.clone());
+                        let mut preprocessing = DummyPreprocessing::<$z>::new(42, &session);
                         let cur_a = preprocessing.next_random().unwrap();
-                        let cur_b = match session.my_role().unwrap() {
+                        let cur_b = match session.my_role() {
                             role if role == bad_role  => Share::new(bad_role, $z::from_scalar(Wrapping(42))),
                             _ => preprocessing.next_random().unwrap(),
                         };
@@ -339,7 +344,7 @@ mod tests {
                     // Online phase so Async
                     //Delay P1 by 1s every round
                     let delay_vec = vec![tokio::time::Duration::from_secs(1)];
-                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, None, NetworkMode::Async, Some(delay_vec), &mut task, None);
+                    let results = execute_protocol_small::<_,_,$z,{$z::EXTENSION_DEGREE}>(parties, threshold, None, NetworkMode::Async, Some(delay_vec), &mut task, None).await;
                     assert_eq!(results.len(), parties);
 
                     for cur_res in results {
