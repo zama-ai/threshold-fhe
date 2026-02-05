@@ -76,7 +76,7 @@ pub static PEAK_ALLOC: peak_alloc::PeakAlloc = peak_alloc::PeakAlloc;
 
 fn main() {
     set_plan();
-    threshold_fhe::allocator::MEM_ALLOCATOR.get_or_init(|| PEAK_ALLOC);
+    nexus::allocator::MEM_ALLOCATOR.get_or_init(|| PEAK_ALLOC);
 
     let transfer = |(ref mut from_amount, ref mut to_amount, ref mut amount, public_key): &mut (
         FheUint64,
