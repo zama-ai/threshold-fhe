@@ -57,8 +57,8 @@ cargo install --force cargo-make
 cargo install --force cargo-criterion
 
 # Clone the repository (replace with submission's repo URL)
-REPO_URL="https://github.com/zama-ai/kms.git"
-TARGET_DIR="$HOME/kms/core/threshold"
+REPO_URL="https://github.com/zama-ai/threshold-fhe.git"
+TARGET_DIR="$HOME/threshold-fhe"
 
 if [ ! -d "$TARGET_DIR" ]; then
     cd $HOME
