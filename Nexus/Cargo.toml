@@ -19,7 +19,6 @@ async-trait.workspace = true
 attestation-doc-validation = { workspace = true, optional = true}
 backoff = { workspace = true, features = ["tokio"], optional = true }
 bc2wrap.workspace = true
-bincode.workspace = true
 cfg-if.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 const_format.workspace = true

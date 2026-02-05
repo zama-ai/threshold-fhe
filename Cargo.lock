@@ -2778,7 +2778,6 @@ dependencies = [
  "attestation-doc-validation",
  "backoff",
  "bc2wrap",
- "bincode 2.0.1",
  "cfg-if",
  "clap",
  "const_format",
