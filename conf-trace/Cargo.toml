@@ -21,7 +21,6 @@ opentelemetry_sdk = { version = "=0.27.1", features = ["rt-tokio", "logs", "metr
 prometheus = { version = "0.13", features = ["process"] }
 tokio = { version = "=1.43.0", features = ["rt", "rt-multi-thread", "macros", "net"] }
 serde = { version = "=1.0.217", features = ["derive", "rc"] }
-strum = "=0.26.3"
 strum_macros = "=0.26.4"
 thiserror = "=2.0.11"
 tonic = "=0.12.3"
